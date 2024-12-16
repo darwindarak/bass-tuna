@@ -1,0 +1,11 @@
+[package]
+name = "daw"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.15.3"
+hound = "3.5.1"
+ratatui = "0.29.0"
+realfft = "3.4.0"
+rustfft = "6.2.0"
