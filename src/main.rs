@@ -1,6 +1,99 @@
 use realfft::RealFftPlanner;
 use std::io::{self, Write};
 
+/// A fixed-size circular buffer
+/// - `buffer`: The underlying storage for the circular buffer.
+/// - `max_size`: The maximum capacity of the buffer.
+/// - `write_index`: The position in the buffer where the next chunk will be written.
+struct CircularBuffer {
+    buffer: Vec<f32>,
+    max_size: usize,
+    write_index: usize,
+}
+
+impl CircularBuffer {
+    /// Creates a new circular buffer with a specified maximum size.
+    ///
+    /// # Arguments
+    /// * `max_size` - The capacity of the buffer (number of elements it can hold).
+    ///
+    /// # Returns
+    /// A `CircularBuffer` instance initialized with zeros.
+    fn new(max_size: usize) -> Self {
+        Self {
+            buffer: vec![0.0; max_size],
+            max_size,
+            write_index: 0,
+        }
+    }
+    /// Adds a chunk of data to the circular buffer.
+    ///
+    /// If the chunk is larger than the buffer size, only the last `max_size` elements are stored.
+    /// If the chunk wraps around the end of the buffer, it is split and written in two parts.
+    ///
+    /// # Arguments
+    /// * `chunk` - A slice of `f32` values to add to the buffer.
+    fn add_chunk(&mut self, chunk: &[f32]) {
+        if chunk.len() < self.max_size {
+            // Case 1: Chunk can fit into the buffer without overflow
+            let remaining = self.max_size - self.write_index;
+
+            if remaining >= chunk.len() {
+                self.buffer[self.write_index..(self.write_index + chunk.len())]
+                    .copy_from_slice(&chunk);
+                self.write_index += chunk.len();
+            } else {
+                // The chunk wraps around the buffer
+                // 1. Copy the first part to the end of the buffer
+                self.buffer[self.write_index..].copy_from_slice(&chunk[..remaining]);
+
+                // 2. Copy the remainder to the beginning of the buffer
+                let wrapped_length = chunk.len() - remaining;
+                self.buffer[..wrapped_length].copy_from_slice(&chunk[remaining..]);
+
+                // Update the write index to the new position
+                self.write_index = wrapped_length;
+            }
+        } else {
+            // Case 2: Chunk is larger than the buffer size
+            // Only the last `max_size` elements are retained
+            let start = chunk.len() - self.max_size;
+            self.write_index = 0;
+            self.buffer.clone_from_slice(&chunk[start..]);
+        }
+    }
+
+    /// Copies the current state of the circular buffer into an output slice.
+    ///
+    /// The data is copied in order, starting from the oldest data to the newest.
+    ///
+    /// # Arguments
+    /// * `output` - A mutable slice where the buffer contents will be copied.
+    ///
+    /// # Panics
+    /// Panics if `output` is not the same length as the circular buffer (`max_size`).
+    fn copy_to_buffer(&mut self, output: &mut [f32]) {
+        assert_eq!(output.len(), self.max_size, "Output slice size mismatch");
+
+        let start_len = self.max_size - self.write_index;
+        output[..start_len].copy_from_slice(&self.buffer[self.write_index..]);
+        output[start_len..].copy_from_slice(&self.buffer[..self.write_index]);
+    }
+
+    /// Returns a copy of the current state of the buffer as a vector.
+    ///
+    /// The data is ordered, starting from the oldest to the newest values.
+    ///
+    /// # Returns
+    /// A `Vec<f32>` containing the buffer contents.
+    fn get_buffer(&self) -> Vec<f32> {
+        let mut result = Vec::with_capacity(self.max_size);
+        result.extend_from_slice(&self.buffer[self.write_index..]);
+        result.extend_from_slice(&self.buffer[..self.write_index]);
+        result
+    }
+}
+
 fn harmonic_energy(f_amplitudes: &[f32], freq_bin: usize, n_harmonics: usize) -> f32 {
     let mut energy = 0.0;
     let window = f_amplitudes.len();
@@ -133,4 +226,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Processing complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CircularBuffer;
+
+    #[test]
+    fn test_new() {
+        let buffer = CircularBuffer::new(5);
+        assert_eq!(buffer.get_buffer(), vec![0.0; 5]);
+    }
+
+    #[test]
+    fn test_add_chunk_fit_exactly() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(buffer.get_buffer(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_add_chunk_smaller_than_buffer() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0]);
+        assert_eq!(buffer.get_buffer(), vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_add_chunk_wrap_around() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0]);
+        buffer.add_chunk(&[4.0, 5.0, 6.0]);
+        // Expected: Last 5 values, wrapped around
+        assert_eq!(buffer.get_buffer(), vec![2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_add_chunk_larger_than_buffer() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        // Expected: Only the last 5 values are retained
+        assert_eq!(buffer.get_buffer(), vec![3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn test_copy_to_buffer_exact_size() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+
+        let mut output = vec![0.0; 5];
+        buffer.copy_to_buffer(&mut output);
+        assert_eq!(output, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_copy_to_buffer_wrap_around() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0]);
+        buffer.add_chunk(&[4.0, 5.0, 6.0]);
+
+        let mut output = vec![0.0; 5];
+        buffer.copy_to_buffer(&mut output);
+        assert_eq!(output, vec![2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Output slice size mismatch")]
+    fn test_copy_to_buffer_invalid_output_size() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0]);
+
+        let mut output = vec![0.0; 4]; // Incorrect size
+        buffer.copy_to_buffer(&mut output);
+    }
 }
