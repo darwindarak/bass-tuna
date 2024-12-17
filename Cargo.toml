@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+assert_approx_eq = "1.1.0"
 cpal = "0.15.3"
 crossterm = "0.28.1"
 hound = "3.5.1"
+rand = "0.8.5"
 ratatui = "0.29.0"
 realfft = "3.4.0"
 rustfft = "6.2.0"

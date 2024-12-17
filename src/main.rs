@@ -2,10 +2,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossterm::{
     cursor::MoveToColumn,
     execute,
-    style::{Color, PrintStyledContent, Stylize},
+    style::{PrintStyledContent, Stylize},
     terminal::{Clear, ClearType},
 };
-use realfft::RealFftPlanner;
 use std::io::stdout;
 use std::{
     io::{self, Write},
@@ -106,87 +105,85 @@ impl CircularBuffer {
     }
 }
 
-fn harmonic_energy(f_amplitudes: &[f32], freq_bin: usize, n_harmonics: usize) -> f32 {
-    let mut energy = 0.0;
-    let window = f_amplitudes.len();
+/// Identifies the fundamental frequency of a signal using the YIN algorithm.
+///
+/// # Arguments
+/// * `input` - A slice of `f32` representing the audio signal samples.
+/// * `sample_rate` - The sampling rate of the audio signal in Hz.
+/// * `min_frequency` - The minimum frequency to detect (e.g., 20.0 Hz for low pitch).
+/// * `max_frequency` - The maximum frequency to detect (e.g., 500.0 Hz for high pitch).
+///
+/// # Returns
+/// * `Option<f32>` - The detected frequency in Hz, or `None` if no valid pitch is found.
+///
+/// # Example Usage
+/// ```
+/// let input = vec![0.1, 0.2, 0.1, -0.1, -0.2, -0.1]; // Example signal
+/// let sample_rate = 44100.0;
+/// let frequency = identify_frequency(&input, sample_rate, 20.0, 500.0);
+/// if let Some(freq) = frequency {
+///     println!("Detected Frequency: {:.2} Hz", freq);
+/// } else {
+///     println!("No frequency detected.");
+/// }
+/// ```
+fn identify_frequency(
+    input: &[f32],
+    sample_rate: f32,
+    min_frequency: f32,
+    max_frequency: f32,
+) -> Option<f32> {
+    // Check if "volume" exceeds threshold
+    let mut volume = 0.0;
+    for amplitude in input {
+        volume += amplitude * amplitude;
+    }
+    let volume_threshold = 0.08;
+    if volume < volume_threshold * volume_threshold {
+        return None;
+    }
 
-    for n in 1..=n_harmonics {
-        let bin = n * freq_bin;
-        if bin < window {
-            energy += f_amplitudes[bin].abs();
+    // Calculate the difference function d(t)
+    let min_period = (sample_rate / max_frequency).floor() as usize;
+    let max_period = (sample_rate / min_frequency).floor() as usize;
+
+    let mut differences: Vec<f32> = vec![0.0; (max_period - min_period) as usize + 1];
+    for (i, period) in (min_period..=max_period).enumerate() {
+        for j in 0..(input.len() - period) {
+            let diff = input[j] - input[j + period];
+            differences[i] += diff * diff;
         }
     }
 
-    energy
-}
+    // Compute the cumulative mean normalized difference function
+    let mut normed_differences = vec![0.0; differences.len()];
+    let mut cumulative_sum = 0.0;
 
-fn freq_to_bin(freq: f32, window: usize, sample_rate: f32) -> usize {
-    (freq * window as f32 / sample_rate).round() as usize
-}
+    for i in 1..differences.len() {
+        cumulative_sum += differences[i];
+        normed_differences[i] = differences[i] / (cumulative_sum / i as f32);
+    }
 
-fn identify_pitch(
-    input: &[f32],
-    options: &[f32],
-    sample_rate: f32,
-    n_harmonics: usize,
-    f_range: f32,
-) -> (f32, f32, usize) {
-    // Perform FFT
-    let fft = RealFftPlanner::<f32>::new().plan_fft_forward(input.len());
+    // Find a the first miniumum that is lower than some threshold
+    let threshold = 0.1; // Typical YIN threshold for valid minima
+    for i in 1..differences.len() - 1 {
+        if normed_differences[i] < threshold
+            && normed_differences[i] < normed_differences[i - 1]
+            && normed_differences[i] < normed_differences[i + 1]
+        {
+            // Parabolic interpolation for sub-sample precision
+            let dp = normed_differences[i - 1];
+            let d = normed_differences[i];
+            let dn = normed_differences[i + 1];
 
-    let mut scratch = fft.make_input_vec();
-    scratch.copy_from_slice(input);
-    let mut output = fft.make_output_vec();
+            let interpolation = (dp - dn) / (2.0 * (2.0 * d - dp - dn));
+            let period = (i + min_period) as f32 + interpolation;
 
-    fft.process(&mut scratch, &mut output)
-        .expect("should be ok");
-
-    let amplitudes: Vec<f32> = output.iter().map(|c| c.norm()).collect();
-    let window = input.len();
-
-    // Convert options to bins
-    let options_bins: Vec<usize> = options
-        .iter()
-        .map(|&freq| freq_to_bin(freq, window, sample_rate))
-        .collect();
-
-    // Calculate harmonic energies
-    let energies: Vec<f32> = options_bins
-        .iter()
-        .map(|&bin| harmonic_energy(&amplitudes, bin, n_harmonics))
-        .collect();
-
-    let i = energies
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
-
-    // Refine pitch
-    let resolution = sample_rate / window as f32;
-    let bin_width = (f_range / resolution).ceil() as usize;
-
-    let center_bin = freq_to_bin(options[i], window, sample_rate);
-    let bins = (center_bin.saturating_sub(bin_width))..=(center_bin + bin_width);
-
-    let energies_hires: Vec<f32> = bins
-        .clone()
-        .map(|bin| harmonic_energy(&amplitudes, bin, n_harmonics))
-        .collect();
-
-    let j = energies_hires
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
-
-    (
-        (*bins.start() + j) as f32 * sample_rate / window as f32,
-        energies_hires[j],
-        i,
-    )
+            // Convert period to frequency
+            return Some(sample_rate / period);
+        }
+    }
+    return None;
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -218,8 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
 
-    let max_window = 5 * sample_rate; // 2 seconds
-
+    let max_window = sample_rate / 10; // 2 seconds
     let options = vec![41.2, 55.0, 73.4, 98.0]; // E1, A1, D2, G2 frequencies
 
     let circular_buffer = Arc::new(Mutex::new(CircularBuffer::new(max_window as usize))); // Share buffer between threads
@@ -235,37 +231,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let pitches = vec!["E", "A", "D", "G"];
 
-            let (pitch, energy, closest_choice) =
-                identify_pitch(&work_buffer, &options, sample_rate as f32, 5, 5.0);
-            let target_pitch = options[closest_choice];
-
-            let cents = 1200.0 * (pitch / target_pitch).log2();
-
-            let output = if energy > 1500.0 {
-                let within_range = cents < 1.5;
+            //let (pitch, energy, closest_choice) =
+            //    identify_pitch(&work_buffer, &options, sample_rate as f32, 5, 5.0);
+            let output = if let Some(freq) =
+                identify_frequency(&work_buffer, sample_rate as f32, 30.0, 150.0)
+            {
+                let mut closest_choice = 0;
+                let mut smallest_difference = 10000f32;
+                for (i, f_ref) in options.iter().enumerate() {
+                    let delta = (f_ref - freq).abs();
+                    if delta < smallest_difference {
+                        closest_choice = i;
+                        smallest_difference = delta;
+                    }
+                }
+                let target_pitch = options[closest_choice];
+                let cents = 1200.0 * (freq / target_pitch).log2();
+                let within_range = cents < 2.0;
                 if within_range {
                     // Print in green if within range
                     format!(
                         "Detected pitch {} ({:.2}): {:.2} Hz ({} cents)",
-                        pitches[closest_choice], target_pitch, pitch, cents
+                        pitches[closest_choice], target_pitch, freq, cents
                     )
                     .green()
                 } else {
                     // Print in yellow if out of range
                     format!(
                         "Detected pitch {} ({:.2}): {:.2} Hz ({} cents)",
-                        pitches[closest_choice], target_pitch, pitch, cents
+                        pitches[closest_choice], target_pitch, freq, cents
                     )
                     .yellow()
                 }
             } else {
-                format!("Not loud enough").red()
+                format!("None found").red()
             };
             let mut stdout = stdout();
             execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine)).unwrap();
             execute!(stdout, PrintStyledContent(output)).unwrap();
             stdout.flush().unwrap();
-            //thread::sleep(std::time::Duration::from_millis(100)); // Control processing frequency
+
+            thread::sleep(std::time::Duration::from_millis(100)); // Control processing frequency
         }
     });
 
@@ -294,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::CircularBuffer;
+    use super::{identify_frequency, CircularBuffer};
 
     #[test]
     fn test_new() {
@@ -313,10 +319,7 @@ mod tests {
     fn test_add_chunk_smaller_than_buffer() {
         let mut buffer = CircularBuffer::new(5);
         buffer.add_chunk(&[1.0, 2.0]);
-        assert_eq!(
-            buffer.get_buffer(),
-            vec![0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0]
-        );
+        assert_eq!(buffer.get_buffer(), vec![0.0, 0.0, 0.0, 1.0, 2.0]);
     }
 
     #[test]
@@ -365,5 +368,66 @@ mod tests {
 
         let mut output = vec![0.0; 4]; // Incorrect size
         buffer.copy_to_buffer(&mut output);
+    }
+
+    use rand::Rng; // For random number generation
+    use std::f32::consts::PI;
+
+    /// Generate a synthetic sine wave signal with harmonics.
+    /// - `f` is the fundamental frequency.
+    /// - `duration` is the signal length in seconds.
+    /// - `fs` is the sampling rate in Hz.
+    /// - `harmonics` is the number of additional harmonics to include.
+    fn generate_sine_with_harmonics(f: f32, duration: f32, fs: f32, harmonics: usize) -> Vec<f32> {
+        let num_samples = (duration * fs) as usize;
+        let mut signal = vec![0.0; num_samples];
+        let dt = 1.0 / fs;
+
+        // Add the fundamental frequency
+        for i in 0..num_samples {
+            signal[i] += (2.0 * PI * f * i as f32 * dt).sin();
+        }
+
+        // Add harmonics
+        let mut rng = rand::thread_rng();
+        for _ in 0..harmonics {
+            let amplitude = rng.gen_range(0.2..1.0); // Random amplitude for harmonics
+            let harmonic_multiplier = rng.gen_range(2..6); // Random integer multiple of the fundamental
+            for i in 0..num_samples {
+                signal[i] +=
+                    amplitude * (2.0 * PI * f * harmonic_multiplier as f32 * i as f32 * dt).sin();
+            }
+        }
+
+        signal
+    }
+
+    #[test]
+    fn test_pitch_detection_yin() {
+        let fs = 44100.0; // Sampling rate in Hz
+        let duration = 1.0; // Signal duration in seconds
+        let min_frequency = 30.0;
+        let max_frequency = 150.0;
+
+        // Generate a random fundamental frequency in the range 30-150 Hz
+        let mut rng = rand::thread_rng();
+        let fundamental_frequency = rng.gen_range(min_frequency..max_frequency);
+
+        // Generate the test signal with harmonics
+        let signal = generate_sine_with_harmonics(fundamental_frequency, duration, fs, 3);
+
+        // Run the pitch detection algorithm
+        let detected_frequency = identify_frequency(&signal, fs, min_frequency, max_frequency);
+
+        // Verify that the detected frequency is approximately the fundamental frequency
+        if let Some(f_est) = detected_frequency {
+            println!(
+                "Actual frequency: {:.2} Hz, Detected frequency: {:.2} Hz",
+                fundamental_frequency, f_est
+            );
+            assert_approx_eq::assert_approx_eq!(fundamental_frequency, f_est, 0.5);
+        } else {
+            panic!("Pitch detection failed to identify a frequency.");
+        }
     }
 }
