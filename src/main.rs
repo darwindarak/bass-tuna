@@ -123,7 +123,7 @@ fn identify_pitch(
     sample_rate: f32,
     n_harmonics: usize,
     f_range: f32,
-) -> (f32, usize, f32) {
+) -> (f32, f32) {
     // Perform FFT
     let fft = RealFftPlanner::<f32>::new().plan_fft_forward(input.len());
 
@@ -176,9 +176,8 @@ fn identify_pitch(
         .unwrap_or(0);
 
     (
-        options[i],
-        i,
         (*bins.start() + j) as f32 * sample_rate / window as f32,
+        energies_hires[j],
     )
 }
 
@@ -227,8 +226,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buf.copy_to_buffer(&mut work_buffer);
             }
 
-            let (_, _, pitch) = identify_pitch(&work_buffer, &options, sample_rate as f32, 5, 5.0);
-            println!("Detected pitch: {:.2} Hz", pitch);
+            let (pitch, energy) =
+                identify_pitch(&work_buffer, &options, sample_rate as f32, 5, 5.0);
+            if energy > 1500.0 {
+                println!(
+                    "Detected pitch: {:.2} Hz with energy level {}",
+                    pitch, energy
+                );
+            }
 
             thread::sleep(std::time::Duration::from_millis(100)); // Control processing frequency
         }
