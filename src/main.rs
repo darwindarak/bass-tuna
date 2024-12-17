@@ -1,5 +1,12 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossterm::{
+    cursor::MoveToColumn,
+    execute,
+    style::{Color, PrintStyledContent, Stylize},
+    terminal::{Clear, ClearType},
+};
 use realfft::RealFftPlanner;
+use std::io::stdout;
 use std::{
     io::{self, Write},
     sync::{Arc, Mutex},
@@ -123,7 +130,7 @@ fn identify_pitch(
     sample_rate: f32,
     n_harmonics: usize,
     f_range: f32,
-) -> (f32, f32) {
+) -> (f32, f32, usize) {
     // Perform FFT
     let fft = RealFftPlanner::<f32>::new().plan_fft_forward(input.len());
 
@@ -178,6 +185,7 @@ fn identify_pitch(
     (
         (*bins.start() + j) as f32 * sample_rate / window as f32,
         energies_hires[j],
+        i,
     )
 }
 
@@ -210,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
 
-    let max_window = 3 * sample_rate; // 2 seconds
+    let max_window = 5 * sample_rate; // 2 seconds
 
     let options = vec![41.2, 55.0, 73.4, 98.0]; // E1, A1, D2, G2 frequencies
 
@@ -225,17 +233,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let buf = process_buffer.lock().unwrap();
                 buf.copy_to_buffer(&mut work_buffer);
             }
+            let pitches = vec!["E", "A", "D", "G"];
 
-            let (pitch, energy) =
+            let (pitch, energy, closest_choice) =
                 identify_pitch(&work_buffer, &options, sample_rate as f32, 5, 5.0);
-            if energy > 1500.0 {
-                println!(
-                    "Detected pitch: {:.2} Hz with energy level {}",
-                    pitch, energy
-                );
-            }
+            let target_pitch = options[closest_choice];
 
-            thread::sleep(std::time::Duration::from_millis(100)); // Control processing frequency
+            let cents = 1200.0 * (pitch / target_pitch).log2();
+
+            let output = if energy > 1500.0 {
+                let within_range = cents < 1.5;
+                if within_range {
+                    // Print in green if within range
+                    format!(
+                        "Detected pitch {} ({:.2}): {:.2} Hz ({} cents)",
+                        pitches[closest_choice], target_pitch, pitch, cents
+                    )
+                    .green()
+                } else {
+                    // Print in yellow if out of range
+                    format!(
+                        "Detected pitch {} ({:.2}): {:.2} Hz ({} cents)",
+                        pitches[closest_choice], target_pitch, pitch, cents
+                    )
+                    .yellow()
+                }
+            } else {
+                format!("Not loud enough").red()
+            };
+            let mut stdout = stdout();
+            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine)).unwrap();
+            execute!(stdout, PrintStyledContent(output)).unwrap();
+            stdout.flush().unwrap();
+            //thread::sleep(std::time::Duration::from_millis(100)); // Control processing frequency
         }
     });
 

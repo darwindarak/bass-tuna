@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 cpal = "0.15.3"
+crossterm = "0.28.1"
 hound = "3.5.1"
 ratatui = "0.29.0"
 realfft = "3.4.0"
