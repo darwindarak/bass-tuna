@@ -1,5 +1,10 @@
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use realfft::RealFftPlanner;
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    sync::{Arc, Mutex},
+    thread,
+};
 
 /// A fixed-size circular buffer
 /// - `buffer`: The underlying storage for the circular buffer.
@@ -72,7 +77,7 @@ impl CircularBuffer {
     ///
     /// # Panics
     /// Panics if `output` is not the same length as the circular buffer (`max_size`).
-    fn copy_to_buffer(&mut self, output: &mut [f32]) {
+    fn copy_to_buffer(&self, output: &mut [f32]) {
         assert_eq!(output.len(), self.max_size, "Output slice size mismatch");
 
         let start_len = self.max_size - self.write_index;
@@ -176,56 +181,80 @@ fn identify_pitch(
         (*bins.start() + j) as f32 * sample_rate / window as f32,
     )
 }
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Read a WAV file
-    print!("Enter the path to the WAV file: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let path = input.trim();
-
-    let mut reader = hound::WavReader::open(path)?;
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate as f32;
-    let channels = spec.channels as usize;
-
-    println!(
-        "Reading WAV file with sample rate: {} Hz, channels: {}",
-        sample_rate, channels
-    );
-
-    let samples: Vec<f32> = reader
-        .samples::<i16>()
-        .filter_map(Result::ok)
-        .map(|s| s as f32 / i16::MAX as f32) // Normalize to [-1.0, 1.0]
+    let host = cpal::default_host();
+    let devices: Vec<_> = host.input_devices()?.collect();
+    let device_names: Vec<String> = devices
+        .iter()
+        .map(|d| d.name().unwrap_or("Unknown".to_string()))
         .collect();
 
-    // Convert to mono if necessary
-    let mono_samples: Vec<f32> = if channels > 1 {
-        samples
-            .chunks(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect()
-    } else {
-        samples
-    };
-
-    let max_window = 2 * 88_200; // 2 seconds of data at 44.1 kHz
-    let chunk_size = 1024;
-    let options = vec![41.2, 55.0, 73.4, 98.0]; // E1, A1, D2, G2 frequencies
-
-    println!("Processing the WAV file...");
-
-    let mut start = 0;
-    while start + max_window <= mono_samples.len() {
-        let work_buffer = &mono_samples[start..start + max_window];
-        let (_, _, pitch) = identify_pitch(work_buffer, &options, sample_rate, 5, 5.0);
-        println!("Detected pitch: {:.4} Hz", pitch);
-        start += chunk_size;
+    println!("Available input devices:");
+    for (i, name) in device_names.iter().enumerate() {
+        println!("{}: {}", i + 1, name);
     }
 
-    println!("Processing complete.");
-    Ok(())
+    print!("Select an input device by number: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let index: usize = input.trim().parse()?;
+
+    let device = devices
+        .get(index - 1)
+        .expect("Invalid input device selection");
+
+    let config = device.default_input_config()?;
+
+    let sample_rate = config.sample_rate().0;
+    let channels = config.channels() as usize;
+
+    let max_window = 3 * sample_rate; // 2 seconds
+
+    let options = vec![41.2, 55.0, 73.4, 98.0]; // E1, A1, D2, G2 frequencies
+
+    let circular_buffer = Arc::new(Mutex::new(CircularBuffer::new(max_window as usize))); // Share buffer between threads
+    let process_buffer = Arc::clone(&circular_buffer);
+    // Thread to process pitch detection
+    thread::spawn(move || {
+        let mut work_buffer = vec![0.0; max_window as usize];
+        loop {
+            // Safely access and retrieve a linearized copy of the buffer
+            {
+                let buf = process_buffer.lock().unwrap();
+                buf.copy_to_buffer(&mut work_buffer);
+            }
+
+            let (_, _, pitch) = identify_pitch(&work_buffer, &options, sample_rate as f32, 5, 5.0);
+            println!("Detected pitch: {:.2} Hz", pitch);
+
+            thread::sleep(std::time::Duration::from_millis(100)); // Control processing frequency
+        }
+    });
+
+    let input_buffer = Arc::clone(&circular_buffer);
+    let stream = device.build_input_stream(
+        &config.into(),
+        move |data: &[f32], _: &_| {
+            let mono_chunk: Vec<f32> = data
+                .chunks(channels)
+                .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                .collect();
+            let mut buf = input_buffer.lock().unwrap();
+            buf.add_chunk(&mono_chunk);
+        },
+        |err| eprintln!("Stream error: {}", err),
+        None,
+    )?;
+
+    stream.play()?;
+
+    println!("Recording and processing audio. Press Ctrl+C to stop.");
+    loop {
+        std::thread::park(); // Keep the main thread alive
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +278,10 @@ mod tests {
     fn test_add_chunk_smaller_than_buffer() {
         let mut buffer = CircularBuffer::new(5);
         buffer.add_chunk(&[1.0, 2.0]);
-        assert_eq!(buffer.get_buffer(), vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+        assert_eq!(
+            buffer.get_buffer(),
+            vec![0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0]
+        );
     }
 
     #[test]
