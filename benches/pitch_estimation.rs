@@ -2,7 +2,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use rand::Rng; // For random number generation
 use std::f32::consts::PI;
 
-use lib::tuner::identify_frequency;
+use lib::tuner::identify_frequency_multiscale;
 
 /// Generate a synthetic sine wave signal with harmonics.
 /// - `f` is the fundamental frequency.
@@ -47,8 +47,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let signal = generate_sine_with_harmonics(fundamental_frequency, duration, fs, 3);
 
     c.bench_function("identify_frequency", |b| {
-        b.iter(|| identify_frequency(&signal, fs, min_frequency, max_frequency))
+        b.iter(|| identify_frequency_multiscale(&signal, fs, min_frequency, max_frequency))
     });
+
+    //c.bench_function("identify_frequency", |b| {
+    //    b.iter(|| identify_frequency(&signal, fs, min_frequency, max_frequency, false))
+    //});
 }
 
 criterion_group!(benches, criterion_benchmark);

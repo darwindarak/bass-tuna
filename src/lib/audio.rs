@@ -126,7 +126,8 @@ pub fn start_audio_processing(device_name: String, pitch_tx: Sender<Option<f32>>
                     let buf = process_buffer.lock().unwrap();
                     buf.copy_to_buffer(&mut work_buffer);
                 }
-                let pitch = identify_frequency(&work_buffer, sample_rate as f32, 30.0, 150.0);
+                let pitch =
+                    identify_frequency(&work_buffer, sample_rate as f32, 30.0, 150.0, false);
 
                 pitch_tx.send(pitch).ok();
                 thread::sleep(std::time::Duration::from_millis(150)); // Control processing frequency
