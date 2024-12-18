@@ -153,3 +153,76 @@ pub fn start_audio_processing(device_name: String, pitch_tx: Sender<Option<f32>>
         stream.play().unwrap();
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new() {
+        let buffer = CircularBuffer::new(5);
+        assert_eq!(buffer.get_buffer(), vec![0.0; 5]);
+    }
+
+    #[test]
+    fn test_add_chunk_fit_exactly() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(buffer.get_buffer(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_add_chunk_smaller_than_buffer() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0]);
+        assert_eq!(buffer.get_buffer(), vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_add_chunk_wrap_around() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0]);
+        buffer.add_chunk(&[4.0, 5.0, 6.0]);
+        // Expected: Last 5 values, wrapped around
+        assert_eq!(buffer.get_buffer(), vec![2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_add_chunk_larger_than_buffer() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        // Expected: Only the last 5 values are retained
+        assert_eq!(buffer.get_buffer(), vec![3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn test_copy_to_buffer_exact_size() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+
+        let mut output = vec![0.0; 5];
+        buffer.copy_to_buffer(&mut output);
+        assert_eq!(output, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_copy_to_buffer_wrap_around() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0]);
+        buffer.add_chunk(&[4.0, 5.0, 6.0]);
+
+        let mut output = vec![0.0; 5];
+        buffer.copy_to_buffer(&mut output);
+        assert_eq!(output, vec![2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Output slice size mismatch")]
+    fn test_copy_to_buffer_invalid_output_size() {
+        let mut buffer = CircularBuffer::new(5);
+        buffer.add_chunk(&[1.0, 2.0, 3.0]);
+
+        let mut output = vec![0.0; 4]; // Incorrect size
+        buffer.copy_to_buffer(&mut output);
+    }
+}

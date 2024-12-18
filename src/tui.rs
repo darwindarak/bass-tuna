@@ -1,5 +1,5 @@
-use crate::audio::start_audio_processing;
 use cpal::traits::{DeviceTrait, HostTrait};
+use lib::audio::start_audio_processing;
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},

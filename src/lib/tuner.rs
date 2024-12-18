@@ -9,17 +9,6 @@
 /// # Returns
 /// * `Option<f32>` - The detected frequency in Hz, or `None` if no valid pitch is found.
 ///
-/// # Example Usage
-/// ```
-/// let input = vec![0.1, 0.2, 0.1, -0.1, -0.2, -0.1]; // Example signal
-/// let sample_rate = 44100.0;
-/// let frequency = identify_frequency(&input, sample_rate, 20.0, 500.0);
-/// if let Some(freq) = frequency {
-///     println!("Detected Frequency: {:.2} Hz", freq);
-/// } else {
-///     println!("No frequency detected.");
-/// }
-/// ```
 pub fn identify_frequency(
     input: &[f32],
     sample_rate: f32,
@@ -77,4 +66,69 @@ pub fn identify_frequency(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng; // For random number generation
+    use std::f32::consts::PI;
+
+    /// Generate a synthetic sine wave signal with harmonics.
+    /// - `f` is the fundamental frequency.
+    /// - `duration` is the signal length in seconds.
+    /// - `fs` is the sampling rate in Hz.
+    /// - `harmonics` is the number of additional harmonics to include.
+    fn generate_sine_with_harmonics(f: f32, duration: f32, fs: f32, harmonics: usize) -> Vec<f32> {
+        let num_samples = (duration * fs) as usize;
+        let mut signal = vec![0.0; num_samples];
+        let dt = 1.0 / fs;
+
+        // Add the fundamental frequency
+        for i in 0..num_samples {
+            signal[i] += (2.0 * PI * f * i as f32 * dt).sin();
+        }
+
+        // Add harmonics
+        let mut rng = rand::thread_rng();
+        for _ in 0..harmonics {
+            let amplitude = rng.gen_range(0.2..1.0); // Random amplitude for harmonics
+            let harmonic_multiplier = rng.gen_range(2..6); // Random integer multiple of the fundamental
+            for i in 0..num_samples {
+                signal[i] +=
+                    amplitude * (2.0 * PI * f * harmonic_multiplier as f32 * i as f32 * dt).sin();
+            }
+        }
+
+        signal
+    }
+
+    #[test]
+    fn test_pitch_detection_yin() {
+        let fs = 44100.0; // Sampling rate in Hz
+        let duration = 1.0; // Signal duration in seconds
+        let min_frequency = 30.0;
+        let max_frequency = 150.0;
+
+        // Generate a random fundamental frequency in the range 30-150 Hz
+        let mut rng = rand::thread_rng();
+        let fundamental_frequency = rng.gen_range(min_frequency..max_frequency);
+
+        // Generate the test signal with harmonics
+        let signal = generate_sine_with_harmonics(fundamental_frequency, duration, fs, 3);
+
+        // Run the pitch detection algorithm
+        let detected_frequency = identify_frequency(&signal, fs, min_frequency, max_frequency);
+
+        // Verify that the detected frequency is approximately the fundamental frequency
+        if let Some(f_est) = detected_frequency {
+            println!(
+                "Actual frequency: {:.2} Hz, Detected frequency: {:.2} Hz",
+                fundamental_frequency, f_est
+            );
+            assert_approx_eq::assert_approx_eq!(fundamental_frequency, f_est, 0.5);
+        } else {
+            panic!("Pitch detection failed to identify a frequency.");
+        }
+    }
 }

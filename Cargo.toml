@@ -3,6 +3,10 @@ name = "daw"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "lib"
+path = "src/lib/mod.rs"
+
 [dependencies]
 cpal = "0.15.3"
 crossterm = "0.28.1"
@@ -14,3 +18,8 @@ rustfft = "6.2.0"
 rand = "0.8.5"
 hound = "3.5.1"
 assert_approx_eq = "1.1.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "pitch_estimation"
+harness = false
