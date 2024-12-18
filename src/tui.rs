@@ -113,6 +113,24 @@ fn draw_device_selection(frame: &mut Frame, model: &Model) {
     frame.render_widget(list, chunks[1]);
 }
 
+fn identify_note(f: f32, fundamental_frequencies: &[f32], n_harmonics: usize) -> (usize, f32) {
+    let mut closest_index = 0;
+    let mut smallest_difference = f32::MAX;
+    let mut harmonic = 1;
+
+    for (i, f_ref) in fundamental_frequencies.iter().enumerate() {
+        for n in 1..=n_harmonics {
+            let delta = (f - (n as f32) * f_ref).abs();
+            if smallest_difference > delta {
+                smallest_difference = delta;
+                closest_index = i;
+                harmonic = n;
+            }
+        }
+    }
+    return (closest_index, f * harmonic as f32);
+}
+
 /// Draw the pitch display screen
 fn draw_pitch_display(frame: &mut Frame, model: &Model) {
     let bass_strings = ["E", "A", "D", "G"];
@@ -120,19 +138,11 @@ fn draw_pitch_display(frame: &mut Frame, model: &Model) {
 
     let pitch_text = if let Some(freq) = model.pitch {
         // Look for the closest matching pitch
-        let mut closest_choice = 0;
-        let mut smallest_difference = f32::MAX;
-        for (i, f_ref) in bass_frequencies.iter().enumerate() {
-            let delta = (f_ref - freq).abs();
-            if delta < smallest_difference {
-                closest_choice = i;
-                smallest_difference = delta;
-            }
-        }
-        let string = bass_strings[closest_choice];
-        let f_ref = bass_frequencies[closest_choice];
-        let cents = 1200.0 * (f_ref / freq).log2();
-        format!("Pitch {}: {:.2} Hz ({:+.1} cents)", string, freq, cents)
+        let (i, pitch) = identify_note(freq, &bass_frequencies, 3);
+        let string = bass_strings[i];
+        let f_ref = bass_frequencies[i];
+        let cents = 1200.0 * (f_ref / pitch).log2();
+        format!("Pitch {}: {:.2} Hz ({:+.1} cents)", string, pitch, cents)
     } else {
         format!("Listening...")
     };
