@@ -1,13 +1,285 @@
 use cpal::traits::{DeviceTrait, HostTrait};
 use lib::audio::start_audio_processing;
 use ratatui::{
-    layout::{Constraint, Layout},
+    buffer::Buffer,
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Span,
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Widget},
     Frame,
 };
-use std::sync::mpsc::Sender;
+use std::{collections::HashMap, sync::mpsc::Sender};
+
+pub struct RulerWidget<'a> {
+    pub current_cents: Option<f32>,
+    pub detected_note: Option<&'a str>, // Detected musical note (e.g., "E2")
+    pub major_cents: f32,
+    pub n_major: i32,
+    pub n_minor: i32,
+    pub block: Option<Block<'a>>, // Optional block for borders and titles
+}
+
+fn build_ascii_map() -> HashMap<char, &'static str> {
+    let mut map = HashMap::new();
+
+    map.insert(
+        'A',
+        r"
+  AAA  
+ A   A 
+ AAAAA 
+ A   A 
+ A   A 
+",
+    );
+
+    map.insert(
+        'B',
+        r"
+ BBBB  
+ B   B 
+ BBBB  
+ B   B 
+ BBBB  
+",
+    );
+
+    map.insert(
+        'C',
+        r"
+  CCCC 
+ C     
+ C     
+ C     
+  CCCC 
+",
+    );
+
+    map.insert(
+        'D',
+        r"
+ DDDD  
+ D   D 
+ D   D 
+ D   D 
+ DDDD  
+",
+    );
+
+    map.insert(
+        'E',
+        r"
+ EEEEE 
+ E     
+ EEEE  
+ E     
+ EEEEE 
+",
+    );
+
+    map.insert(
+        'F',
+        r"
+ FFFFF 
+ F     
+ FFFF  
+ F     
+ F     
+",
+    );
+
+    map.insert(
+        'G',
+        r"
+  GGGG 
+ G     
+ G  GG 
+ G   G 
+  GGGG 
+",
+    );
+
+    map.insert(
+        '#',
+        r"
+   #  #  
+ ####### 
+  #  #   
+#######  
+ #  #    
+",
+    );
+
+    map.insert(
+        'b',
+        r"
+     b   
+    b    
+   bbbb  
+  b   b  
+ bbbbb   
+",
+    );
+
+    map.insert(
+        ' ',
+        r"
+       
+       
+       
+       
+       
+",
+    );
+
+    map
+}
+
+impl<'a> Widget for RulerWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        // Draw the block (if provided)
+        if let Some(block) = &self.block {
+            block.render(area, buf);
+        }
+
+        let color = if let Some(cents) = self.current_cents {
+            if cents.abs() < 2.0 {
+                Color::Green
+            } else if cents.abs() < 10.0 {
+                Color::Yellow
+            } else {
+                Color::Red
+            }
+        } else {
+            Color::default()
+        };
+
+        // Define the drawable area (subtract border size)
+        let inner_area = match self.block {
+            Some(block) => block.inner(area),
+            None => area,
+        };
+
+        // Ensure we have enough height for the ruler
+        if inner_area.height < 10 {
+            return;
+        }
+
+        // Fixed range for the ruler
+        let center_x = inner_area.width / 2;
+
+        let ascii_map = build_ascii_map();
+        let mut ascii_lines = vec![];
+        //let step_per_tick = 2; // Cents per tick
+
+        // Render block letters (if a note is detected)
+        for c in self.detected_note.unwrap_or(" ").chars() {
+            if let Some(ascii) = ascii_map.get(&c.to_ascii_uppercase()) {
+                let lines: Vec<&str> = ascii.split('\n').collect();
+                if ascii_lines.is_empty() {
+                    ascii_lines = vec![String::new(); lines.len()];
+                }
+                for (i, line) in lines.iter().enumerate() {
+                    ascii_lines[i].push_str(line);
+                    ascii_lines[i].push(' '); // Add spacing between characters
+                }
+            }
+        }
+
+        // Calculate starting row for block letters
+        //let block_letter_height = ascii_lines.len();
+        let block_start_y = inner_area.y;
+
+        // Render block letters
+        for (i, line) in ascii_lines.iter().enumerate() {
+            let y = block_start_y + i as u16;
+            if y < inner_area.y + inner_area.height {
+                let x = inner_area.x + (inner_area.width.saturating_sub(line.len() as u16) / 2);
+                for (j, c) in line.chars().enumerate() {
+                    let x_pos = x + j as u16;
+                    //if x_pos < inner_area.x + inner_area.width {
+                    buf[(x_pos, y)]
+                        .set_char(c)
+                        .set_style(Style::default().fg(color).add_modifier(Modifier::BOLD));
+                    //}
+                }
+            }
+        }
+        let letter_height = ascii_lines.len() as u16;
+
+        let n_markers = self.n_major * self.n_minor;
+        let minor_steps = self.major_cents / (self.n_minor as f32);
+
+        let (label_range, marker_center) = if let Some(cents) = self.current_cents {
+            let marker_center = ((cents / minor_steps).round() as i32).clamp(
+                -(self.n_major as f32 * self.major_cents) as i32,
+                (self.n_major as f32 * self.major_cents) as i32,
+            );
+            let label = format!("{:+.1}", cents);
+            let label_offset = (label.len() / 2) as i32;
+            let label_start = marker_center - label_offset;
+            let label_end = label_start + label.len() as i32;
+            for (i, c) in label.chars().enumerate() {
+                let x = center_x as i32 + marker_center - label_offset + i as i32;
+                buf[(inner_area.x + x as u16, inner_area.y + letter_height + 2)].set_char(c);
+            }
+            (label_start..label_end, marker_center)
+        } else {
+            (0..0, n_markers + 1)
+        };
+
+        for i in -n_markers..=n_markers {
+            let x = (center_x as i32 + i) as u16;
+            let is_major = i % self.n_major == 0;
+
+            let (marker_color, marker) = if i == marker_center {
+                (color, '🮋')
+            } else {
+                (Color::Gray, '┃')
+            };
+
+            if is_major {
+                // Draw the top and bottom stems since they are always the drawn
+                for y in [1, 3] {
+                    buf[(inner_area.x + x, inner_area.y + y + letter_height)]
+                        .set_char(marker)
+                        .set_style(Style::default().fg(marker_color));
+                }
+
+                // The middle stem is only draw if it's not on top of the label
+                if !label_range.contains(&i) {
+                    buf[(inner_area.x + x, inner_area.y + 2 + letter_height)]
+                        .set_char('┃')
+                        .set_style(Style::default().fg(Color::Gray));
+                }
+
+                let label = format!("{:+}", (i / self.n_minor) as f32 * self.major_cents);
+                let label_start = label.len() / 2;
+                for (i, c) in label.chars().enumerate() {
+                    let label_x =
+                        (inner_area.x + x as u16).saturating_sub(label_start as u16) + i as u16;
+                    if label_x < inner_area.x + inner_area.width {
+                        buf[(label_x, inner_area.y + letter_height + 4)]
+                            .set_char(c)
+                            .set_style(Style::default().fg(Color::White));
+                    }
+                }
+            } else {
+                if i == marker_center {
+                    for y in [1, 3] {
+                        buf[(inner_area.x + x, inner_area.y + y + letter_height)]
+                            .set_char('🮋')
+                            .set_style(Style::default().fg(color));
+                    }
+                } else {
+                    buf[(inner_area.x + x, inner_area.y + 3 + letter_height)]
+                        .set_char('┊')
+                        .set_style(Style::default().fg(Color::Gray));
+                }
+            }
+        }
+    }
+}
 
 enum AppState {
     DeviceSelection,
@@ -136,24 +408,26 @@ fn draw_pitch_display(frame: &mut Frame, model: &Model) {
     let bass_strings = ["E", "A", "D", "G"];
     let bass_frequencies = [41.2, 55.0, 73.4, 98.0];
 
-    let pitch_text = if let Some(freq) = model.pitch {
+    let (current_cents, detected_note) = if let Some(freq) = model.pitch {
         // Look for the closest matching pitch
         let (i, pitch) = identify_note(freq, &bass_frequencies, 3);
         let string = bass_strings[i];
         let f_ref = bass_frequencies[i];
         let cents = 1200.0 * (f_ref / pitch).log2();
-        format!("Pitch {}: {:.2} Hz ({:+.1} cents)", string, pitch, cents)
+
+        (Some(cents), Some(string))
     } else {
-        format!("Listening...")
+        (None, None)
     };
 
-    let paragraph = Paragraph::new(pitch_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Pitch Detection"),
-        )
-        .style(Style::default().fg(Color::Cyan));
+    let widget = RulerWidget {
+        current_cents,
+        detected_note,
+        block: Some(Block::default().borders(Borders::ALL).title("Tuner")),
+        major_cents: 5.0,
+        n_major: 5,
+        n_minor: 5,
+    };
 
-    frame.render_widget(paragraph, frame.area());
+    frame.render_widget(widget, frame.area());
 }

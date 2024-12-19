@@ -129,7 +129,7 @@ pub fn identify_frequency(
     for amplitude in input {
         volume += amplitude * amplitude;
     }
-    let volume_threshold = 0.08;
+    let volume_threshold = 0.04;
     if volume < volume_threshold * volume_threshold {
         return None;
     }
