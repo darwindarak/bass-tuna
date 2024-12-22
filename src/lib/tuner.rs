@@ -1,109 +1,186 @@
 use std::f32::consts::PI;
 
-/// Computes FIR low-pass filter coefficients with a Hamming window.
+/// A collection of resonators tuned to specific frequencies.
+pub struct Resonators {
+    frequencies: Vec<f32>,           // Target frequencies for the resonators
+    filters: Vec<BiquadFilter>,      // Filters tuned to the target frequencies
+    energy_histories: Vec<Vec<f32>>, // Historical energy values for each filter
+    energies: Vec<f32>,              // Current energy levels for each filter
+    n_energy_history: usize,         // Number of historical energy samples to track
+    current_energy_index: usize,     // Index for circular buffer management
+}
+
+impl Resonators {
+    /// Creates a new Resonators instance with specified frequencies, sample rate, and quality factor.
+    ///
+    /// # Arguments
+    /// * `frequencies` - A slice of target frequencies in Hz.
+    /// * `sample_rate` - The sample rate of the audio in Hz.
+    /// * `q` - The quality factor for the resonators.
+    /// * `n_energy_history` - The size of the energy history buffer.
+    pub fn new(frequencies: &[f32], sample_rate: i32, q: f32, n_energy_history: usize) -> Self {
+        let filters: Vec<BiquadFilter> = frequencies
+            .iter()
+            .map(|&f| BiquadFilter::new(f, sample_rate, q))
+            .collect();
+
+        let energy_histories: Vec<Vec<f32>> = vec![vec![0.0; n_energy_history]; frequencies.len()];
+        let energies = vec![0.0; frequencies.len()];
+
+        Self {
+            frequencies: frequencies.to_vec(),
+            filters,
+            energy_histories,
+            energies,
+            n_energy_history,
+            current_energy_index: 0,
+        }
+    }
+
+    /// Returns the frequency and energy of the current peak resonator.
+    ///
+    /// # Returns
+    /// A tuple containing the frequency and energy of the peak.
+    pub fn current_peak(&self) -> (f32, f32) {
+        self.energies
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(ind, &energy)| (self.frequencies[ind], energy))
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// Processes a new batch of audio samples and updates the resonator energies.
+    ///
+    /// # Arguments
+    /// * `samples` - A slice of input audio samples.
+    pub fn process_new_samples(&mut self, samples: &[f32]) {
+        for &sample in samples {
+            for (n_filter, filter) in self.filters.iter_mut().enumerate() {
+                let y = filter.apply(sample);
+                let energy = y * y;
+
+                // Update running energy using the circular buffer
+                self.energies[n_filter] +=
+                    energy - self.energy_histories[n_filter][self.current_energy_index];
+                self.energy_histories[n_filter][self.current_energy_index] = energy;
+            }
+            self.current_energy_index = (self.current_energy_index + 1) % self.n_energy_history;
+        }
+    }
+}
+
+/// A biquad filter implementation for resonator filtering.
+struct BiquadFilter {
+    b_0: f32, // Feedforward coefficient
+    b_1: f32,
+    b_2: f32,
+    a_1: f32, // Feedback coefficient
+    a_2: f32,
+
+    y_1: f32, // Previous output sample (y[n-1])
+    y_2: f32, // Output sample (y[n-2])
+    x_1: f32, // Previous input sample (x[n-1])
+    x_2: f32, // Input sample (x[n-2])
+}
+
+impl BiquadFilter {
+    /// Applies the filter to a single input sample and returns the output sample.
+    ///
+    /// # Arguments
+    /// * `x` - The input sample.
+    ///
+    /// # Returns
+    /// The filtered output sample.
+    fn apply(&mut self, x: f32) -> f32 {
+        let y = self.b_0 * x + self.b_1 * self.x_1 + self.b_2 * self.x_2
+            - self.a_1 * self.y_1
+            - self.a_2 * self.y_2;
+
+        // Update state variables
+        self.y_2 = self.y_1;
+        self.y_1 = y;
+        self.x_2 = self.x_1;
+        self.x_1 = x;
+
+        y
+    }
+
+    /// Creates a new biquad filter tuned to a specific frequency.
+    ///
+    /// # Arguments
+    /// * `f0` - The target frequency in Hz.
+    /// * `sample_rate` - The sample rate of the audio in Hz.
+    /// * `q` - The quality factor of the filter.
+    ///
+    /// # Returns
+    /// A new `BiquadFilter` instance.
+    pub fn new(f0: f32, sample_rate: i32, q: f32) -> Self {
+        let k = f0 / sample_rate as f32;
+        let omega_0 = 2.0 * PI * k;
+        let alpha = omega_0.sin() / (2.0 * q);
+
+        let a_0 = 1.0 + alpha;
+        let a_1 = -2.0 * omega_0.cos() / a_0;
+        let a_2 = (1.0 - alpha) / a_0;
+
+        let b_0 = alpha / a_0;
+        let b_1 = 0.0;
+        let b_2 = -b_0;
+
+        Self {
+            b_0,
+            b_1,
+            b_2,
+            a_1,
+            a_2,
+            y_1: 0.0,
+            y_2: 0.0,
+            x_1: 0.0,
+            x_2: 0.0,
+        }
+    }
+}
+
+/// Identifies the musical note name, pitch, and cents offset for a given frequency.
 ///
 /// # Arguments
-/// - `normalized_cutoff`: The normalized cutoff frequency (cutoff / Nyquist frequency).
-/// - `num_taps`: The number of filter coefficients (taps).
+/// * `f` - The frequency in Hz to identify.
 ///
 /// # Returns
-/// A vector of FIR filter coefficients.
-fn lowpass_coefficients(normalized_cutoff: f32, num_taps: usize) -> Vec<f32> {
-    let mut coefficients = Vec::with_capacity(num_taps);
-    let half_taps = (num_taps - 1) / 2;
+/// A tuple containing:
+/// * The name of the note (e.g., "A", "C", "G#").
+/// * The pitch of the note in Hz.
+/// * The offset in cents relative to the given frequency.
+pub fn identify_note_name(f: f32) -> (String, f32, f32) {
+    // Calculate the MIDI note number (A440 corresponds to MIDI note 49)
+    let n = (12.0 * (f / 440.0).log2()).round() as i32 + 49;
 
-    for i in 0..num_taps {
-        let n = i as isize - half_taps as isize;
-
-        // Sinc function (handle the n = 0 case separately to avoid division by zero)
-        let x = 2.0 * normalized_cutoff * n as f32;
-        let sinc = if n == 0 {
-            2.0 * normalized_cutoff
-        } else {
-            2.0 * normalized_cutoff * (PI * x).sin() / x
-        };
-
-        // Hamming window
-        let hamming = 0.54 - 0.46 * (2.0 * PI * i as f32 / (num_taps - 1) as f32).cos();
-
-        coefficients.push(sinc * hamming);
+    // Determine the note name using the MIDI note number modulo 12
+    let name = match n % 12 {
+        0 => "Ab",
+        1 => "A",
+        2 => "Bb",
+        3 => "B",
+        4 => "C",
+        5 => "Db",
+        6 => "D",
+        7 => "Eb",
+        8 => "E",
+        9 => "F",
+        10 => "Gb",
+        11 => "G",
+        _ => panic!("Unexpected note number: {}", n),
     }
+    .to_string();
 
-    // Normalize coefficients to ensure unity gain at DC
-    let sum: f32 = coefficients.iter().sum();
-    coefficients.iter_mut().for_each(|c| *c /= sum);
+    // Calculate the exact pitch of the note
+    let pitch = 440.0 * 2.0f32.powf((n as f32 - 49.0) / 12.0);
 
-    coefficients
-}
+    // Calculate the cents offset from the given frequency
+    let cents = 1200.0 * (f / pitch).log2();
 
-/// Applies convolution to an input signal with a given set of coefficients.
-///
-/// # Arguments
-/// - `input`: The input signal (vector of samples).
-/// - `coefficients`: The FIR filter coefficients.
-/// - `output`: The output vector where the result will be stored. Must be preallocated to the same size as `input`.
-fn convolve(input: &[f32], coefficients: &[f32], output: &mut [f32]) {
-    let num_taps = coefficients.len();
-    let half_taps = num_taps / 2;
-
-    // Ensure output is the correct size
-    assert_eq!(
-        input.len(),
-        output.len(),
-        "Output size must match input size"
-    );
-
-    // Perform convolution
-    for i in 0..input.len() {
-        let mut acc = 0.0;
-        for j in 0..num_taps {
-            let idx = i as isize + j as isize - half_taps as isize;
-            if idx >= 0 && idx < input.len() as isize {
-                acc += input[idx as usize] * coefficients[j];
-            }
-        }
-        output[i] = acc;
-    }
-}
-
-fn downsample_with_lowpass(
-    input: &[f32],
-    downsample_factor: usize,
-    fir_coefficients: &[f32],
-    output: &mut [f32],
-) {
-    let mut filtered = vec![0.0f32; input.len()];
-    convolve(input, &fir_coefficients, &mut filtered);
-
-    for (i, j) in (0..filtered.len()).step_by(downsample_factor).enumerate() {
-        output[i] = filtered[j];
-    }
-}
-
-pub fn identify_frequency_multiscale(
-    input: &[f32],
-    sample_rate: f32,
-    min_frequency: f32,
-    max_frequency: f32,
-) -> Option<f32> {
-    let downsample_factor = (sample_rate / (6.0 * max_frequency)).floor() as usize;
-    let nyquist = sample_rate / 2.0;
-    let cutoff = sample_rate / (2.0 * downsample_factor as f32);
-    let normalized_cutoff = cutoff / nyquist;
-    let mut filtered = vec![0.0f32; input.len()];
-    let coeffs = lowpass_coefficients(normalized_cutoff, 31);
-
-    downsample_with_lowpass(&input, downsample_factor, &coeffs, &mut filtered);
-    if let Some(f_rough) = identify_frequency(
-        &filtered,
-        sample_rate / downsample_factor as f32,
-        min_frequency,
-        max_frequency,
-        false,
-    ) {
-        return identify_frequency(&input, sample_rate, f_rough - 10.0, f_rough + 10.0, true);
-    }
-    None
+    (name, pitch, cents)
 }
 
 /// Identifies the fundamental frequency of a signal using the YIN algorithm.
@@ -129,7 +206,7 @@ pub fn identify_frequency(
     for amplitude in input {
         volume += amplitude * amplitude;
     }
-    let volume_threshold = 0.04;
+    let volume_threshold = 0.01;
     if volume < volume_threshold * volume_threshold {
         return None;
     }
@@ -184,7 +261,8 @@ pub fn identify_frequency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng; // For random number generation
+    use assert_approx_eq::assert_approx_eq;
+    use rand::Rng;
     use std::f32::consts::PI;
 
     /// Generate a synthetic sine wave signal with harmonics.
@@ -240,14 +318,14 @@ mod tests {
                 "Actual frequency: {:.2} Hz, Detected frequency: {:.2} Hz",
                 fundamental_frequency, f_est
             );
-            assert_approx_eq::assert_approx_eq!(fundamental_frequency, f_est, 0.5);
+            assert_approx_eq!(fundamental_frequency, f_est, 0.5);
         } else {
             panic!("Pitch detection failed to identify a frequency.");
         }
     }
 
     #[test]
-    fn test_multiscale_pitch_detection_yin() {
+    fn test_resonator_pitch_detection_yin() {
         let fs = 44100.0; // Sampling rate in Hz
         let duration = 1.0; // Signal duration in seconds
         let min_frequency = 30.0;
@@ -260,9 +338,15 @@ mod tests {
         // Generate the test signal with harmonics
         let signal = generate_sine_with_harmonics(fundamental_frequency, duration, fs, 3);
 
-        // Run the pitch detection algorithm
-        let detected_frequency =
-            identify_frequency_multiscale(&signal, fs, min_frequency, max_frequency);
+        let mut resonators = Resonators::new(
+            &[30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0],
+            fs as i32,
+            10.0,
+            fs as usize / 20,
+        );
+        resonators.process_new_samples(&signal);
+        let (freq, _) = resonators.current_peak();
+        let detected_frequency = identify_frequency(&signal, fs, freq - 10.0, freq + 10.0, true);
 
         // Verify that the detected frequency is approximately the fundamental frequency
         if let Some(f_est) = detected_frequency {
@@ -270,9 +354,41 @@ mod tests {
                 "Actual frequency: {:.2} Hz, Detected frequency: {:.2} Hz",
                 fundamental_frequency, f_est
             );
-            assert_approx_eq::assert_approx_eq!(fundamental_frequency, f_est, 0.5);
+            assert_approx_eq!(fundamental_frequency, f_est, 0.5);
         } else {
             panic!("Pitch detection failed to identify a frequency.");
         }
+    }
+
+    #[test]
+    fn test_identify_note_name_exact() {
+        let (name, pitch, cents) = identify_note_name(440.0);
+        assert_eq!(name, "A");
+        assert!((pitch - 440.0).abs() < 1e-6);
+        assert!((cents - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_identify_note_name_sharp() {
+        let (name, pitch, cents) = identify_note_name(466.1638);
+        assert_eq!(name, "Bb");
+        assert_approx_eq!(pitch, 466.1638, 1e-6);
+        assert_approx_eq!(cents, 0.00, 1e-2);
+    }
+
+    #[test]
+    fn test_identify_note_name_flat() {
+        let (name, pitch, cents) = identify_note_name(415.3047);
+        assert_eq!(name, "Ab");
+        assert_approx_eq!(pitch, 415.3047, 1e-6);
+        assert_approx_eq!(cents, 0.00, 1e-2);
+    }
+
+    #[test]
+    fn test_identify_note_name_cents_offset() {
+        let (name, pitch, cents) = identify_note_name(445.0);
+        assert_eq!(name, "A");
+        assert_approx_eq!(pitch, 440.0, 1e-6);
+        assert_approx_eq!(cents, 19.56, 1e-2);
     }
 }

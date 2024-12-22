@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait};
 use lib::audio::start_audio_processing;
+use lib::tuner::identify_note_name;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
@@ -12,7 +13,7 @@ use std::{collections::HashMap, sync::mpsc::Sender};
 
 pub struct RulerWidget<'a> {
     pub current_cents: Option<f32>,
-    pub detected_note: Option<&'a str>, // Detected musical note (e.g., "E2")
+    pub detected_note: Option<String>, // Detected musical note (e.g., "E2")
     pub major_cents: f32,
     pub n_major: i32,
     pub n_minor: i32,
@@ -21,6 +22,17 @@ pub struct RulerWidget<'a> {
 
 fn build_ascii_map() -> HashMap<char, &'static str> {
     let mut map = HashMap::new();
+
+    map.insert(
+        '/',
+        r"
+      // 
+     //  
+    //   
+   //    
+  //     
+",
+    );
 
     map.insert(
         'A',
@@ -173,8 +185,8 @@ impl<'a> Widget for RulerWidget<'a> {
         //let step_per_tick = 2; // Cents per tick
 
         // Render block letters (if a note is detected)
-        for c in self.detected_note.unwrap_or(" ").chars() {
-            if let Some(ascii) = ascii_map.get(&c.to_ascii_uppercase()) {
+        for c in self.detected_note.unwrap_or(" ".into()).chars() {
+            if let Some(ascii) = ascii_map.get(&c) {
                 let lines: Vec<&str> = ascii.split('\n').collect();
                 if ascii_lines.is_empty() {
                     ascii_lines = vec![String::new(); lines.len()];
@@ -362,7 +374,7 @@ fn draw_device_selection(frame: &mut Frame, model: &Model) {
         .split(frame.area());
 
     let header = Paragraph::new("Select an Input Device")
-        .block(Block::default().borders(Borders::ALL).title("Audio Tuner"));
+        .block(Block::default().borders(Borders::ALL).title("Tuna"));
     frame.render_widget(header, chunks[0]);
 
     let items: Vec<ListItem> = model
@@ -385,37 +397,12 @@ fn draw_device_selection(frame: &mut Frame, model: &Model) {
     frame.render_widget(list, chunks[1]);
 }
 
-fn identify_note(f: f32, fundamental_frequencies: &[f32], n_harmonics: usize) -> (usize, f32) {
-    let mut closest_index = 0;
-    let mut smallest_difference = f32::MAX;
-    let mut harmonic = 1;
-
-    for (i, f_ref) in fundamental_frequencies.iter().enumerate() {
-        for n in 1..=n_harmonics {
-            let delta = (f - (n as f32) * f_ref).abs();
-            if smallest_difference > delta {
-                smallest_difference = delta;
-                closest_index = i;
-                harmonic = n;
-            }
-        }
-    }
-    return (closest_index, f * harmonic as f32);
-}
-
 /// Draw the pitch display screen
 fn draw_pitch_display(frame: &mut Frame, model: &Model) {
-    let bass_strings = ["E", "A", "D", "G"];
-    let bass_frequencies = [41.2, 55.0, 73.4, 98.0];
-
     let (current_cents, detected_note) = if let Some(freq) = model.pitch {
-        // Look for the closest matching pitch
-        let (i, pitch) = identify_note(freq, &bass_frequencies, 3);
-        let string = bass_strings[i];
-        let f_ref = bass_frequencies[i];
-        let cents = 1200.0 * (f_ref / pitch).log2();
+        let (note, _, cents) = identify_note_name(freq);
 
-        (Some(cents), Some(string))
+        (Some(cents), Some(note))
     } else {
         (None, None)
     };
@@ -423,7 +410,7 @@ fn draw_pitch_display(frame: &mut Frame, model: &Model) {
     let widget = RulerWidget {
         current_cents,
         detected_note,
-        block: Some(Block::default().borders(Borders::ALL).title("Tuner")),
+        block: Some(Block::default().borders(Borders::ALL).title("Tuna")),
         major_cents: 5.0,
         n_major: 5,
         n_minor: 5,

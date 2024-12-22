@@ -1,4 +1,4 @@
-use crate::tuner::identify_frequency;
+use crate::tuner::{identify_frequency, Resonators};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::mpsc::Sender;
 use std::{
@@ -115,19 +115,55 @@ pub fn start_audio_processing(device_name: String, pitch_tx: Sender<Option<f32>>
 
         let max_window = sample_rate / 10; // 2 seconds
 
+        let candidate_frequencies: Vec<f32> = (1..=24)
+            .into_iter()
+            .map(|n| 36.70810 * 2.0f32.powf(n as f32 / 12.0))
+            .collect();
+
+        let resonators = Arc::new(Mutex::new(Resonators::new(
+            &candidate_frequencies,
+            sample_rate as i32,
+            10.0,
+            sample_rate as usize / 20,
+        )));
+
         let circular_buffer = Arc::new(Mutex::new(CircularBuffer::new(max_window as usize))); // Share buffer between threads
         let process_buffer = Arc::clone(&circular_buffer);
+        let resonators_read = Arc::clone(&resonators);
+
         // Thread to process pitch detection
         thread::spawn(move || {
             let mut work_buffer = vec![0.0; max_window as usize];
             loop {
                 // Safely access and retrieve a linearized copy of the buffer
-                {
+                let f_candidate = {
                     let buf = process_buffer.lock().unwrap();
                     buf.copy_to_buffer(&mut work_buffer);
+                    let r = resonators_read.lock().unwrap();
+                    let (f_candidate, _) = r.current_peak();
+                    f_candidate
+                };
+
+                let mut pitch = identify_frequency(
+                    &work_buffer,
+                    sample_rate as f32,
+                    f_candidate - 5.0,
+                    f_candidate + 5.0,
+                    true,
+                );
+
+                // Sometimes the 2nd harmonic is more energetic than the fundamental frequency
+                // but it's not enough to trigger detection via autocorrelation.  So we will
+                // also check the half-frequency to see if it's a match
+                if pitch.is_none() {
+                    pitch = identify_frequency(
+                        &work_buffer,
+                        sample_rate as f32,
+                        0.5 * f_candidate - 5.0,
+                        0.5 * f_candidate + 5.0,
+                        true,
+                    );
                 }
-                let pitch =
-                    identify_frequency(&work_buffer, sample_rate as f32, 30.0, 150.0, false);
 
                 pitch_tx.send(pitch).ok();
                 thread::sleep(std::time::Duration::from_millis(150)); // Control processing frequency
@@ -145,6 +181,8 @@ pub fn start_audio_processing(device_name: String, pitch_tx: Sender<Option<f32>>
                         .collect();
                     let mut buf = input_buffer.lock().unwrap();
                     buf.add_chunk(&mono_chunk);
+                    let mut r = resonators.lock().unwrap();
+                    r.process_new_samples(&mono_chunk);
                 },
                 |err| eprintln!("Stream error: {}", err),
                 None,
