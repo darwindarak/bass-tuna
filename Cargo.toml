@@ -1,7 +1,15 @@
 [package]
-name = "tuna"
+name = "bass-tuna"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+authors = ["Darwin Darakananda <darwindarak@gmail.com>"]
+keywords = ["cli", "tool", "audio", "music"]
+categories = ["command-line-utilities"]
+repository = "https://github.com/darwindarak/bass-tuna"
+description = """
+A terminal-based string instrument tuner.
+"""
 
 [lib]
 name = "lib"
