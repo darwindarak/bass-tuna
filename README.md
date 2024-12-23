@@ -1,4 +1,4 @@
-# string-tuna 🐟
+# bass-tuna 🐟
 
 A terminal-based ~~instrument~~ ~~bass~~ 4-string bass guitar tuner.
 Because my clip-on tuner ran out of battery, and things ...spiraled...
