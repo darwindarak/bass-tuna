@@ -64,6 +64,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
 
 [[package]]
+name = "bass-tuna"
+version = "0.1.0"
+dependencies = [
+ "assert_approx_eq",
+ "cpal",
+ "criterion",
+ "crossterm",
+ "rand",
+ "ratatui",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1258,18 +1270,6 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "winnow",
-]
-
-[[package]]
-name = "tuna"
-version = "0.1.0"
-dependencies = [
- "assert_approx_eq",
- "cpal",
- "criterion",
- "crossterm",
- "rand",
- "ratatui",
 ]
 
 [[package]]

@@ -1,10 +1,158 @@
 use crate::tuner::{identify_frequency, Resonators};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::f32::consts::PI;
 use std::sync::mpsc::Sender;
 use std::{
     sync::{Arc, Mutex},
     thread,
 };
+
+/// A single-pole IIR lowpass filter.
+struct Lowpass {
+    alpha: f32,
+
+    y_1: f32, // internal state to store the previous output
+}
+
+impl Lowpass {
+    /// Creates a new lowpass filter.
+    ///
+    /// # Arguments
+    /// * `sample_rate` - The sampling rate of the input signal in Hz.
+    /// * `cutoff_frequency` - The cutoff frequency for the lowpass filter in Hz.
+    pub fn new(sample_rate: usize, cutoff_frequency: f32) -> Self {
+        let omega = 2.0 * PI * cutoff_frequency / sample_rate as f32;
+        let alpha = omega / (omega + 1.0);
+
+        Lowpass { alpha, y_1: 0.0 }
+    }
+
+    /// Applies the lowpass filter to a single sample.
+    ///
+    /// # Arguments
+    /// * `x` - The current input sample.
+    ///
+    /// # Returns
+    /// The filtered output.
+    pub fn apply(&mut self, x: f32) -> f32 {
+        let y = self.y_1 + self.alpha * (x - self.y_1);
+        self.y_1 = y;
+
+        y
+    }
+}
+
+/// Represents a detected pulse in the input signal.
+#[derive(Clone, Copy)]
+pub struct Pulse {
+    pub energy: f32,
+    pub duration: usize,
+    pub max_amplitude: f32,
+    pub max_time_index: usize,
+}
+
+/// Detects pulses in an audio signal based on energy thresholding.
+pub struct PulseDetector {
+    filter: Lowpass,
+    threshold: f32,
+    progress: Option<Pulse>,
+}
+
+impl PulseDetector {
+    /// Creates a new pulse detector.
+    ///
+    /// # Arguments
+    /// * `sample_rate` - The sampling rate of the input signal in Hz.
+    /// * `cutoff_frequency` - Cutoff frequency for the lowpass filter in Hz.
+    /// * `threshold` - Energy threshold for detecting pulses.
+    pub fn new(sample_rate: usize, cutoff_frequency: f32, threshold: f32) -> Self {
+        let filter = Lowpass::new(sample_rate, cutoff_frequency);
+        PulseDetector {
+            filter,
+            threshold,
+            progress: None,
+        }
+    }
+
+    /// Processes a new batch of samples and detects pulses based on energy.
+    ///
+    /// The function uses a lowpass filter to smooth the squared amplitude (energy) of the signal.
+    /// Pulses are detected when the energy exceeds a specified threshold. It handles different
+    /// scenarios, including pulses that start in the current input, continue from previous samples,
+    /// or end within the input.
+    ///
+    /// # Arguments
+    /// * `samples` - A slice of input samples (assumed to be pre-processed).
+    ///
+    /// # Returns
+    /// * `None` - If no complete pulse is detected.
+    /// * `Some((Pulse, usize))` - If a pulse is completed, returns the `Pulse` and its
+    ///    end index within the batch.
+    ///
+    /// # Scenarios
+    /// 1. **No Pulse**:
+    ///    - The energy of all samples is below the threshold.
+    ///    - The function will return `None` without modifying the internal state.
+    ///
+    /// 2. **Input contains a full pulse**:
+    ///    - A pulse begins in the current batch (energy exceeds the threshold), but the
+    ///      energy never falls back below the threshold within the same batch.
+    ///    - The function will update `self.progress` to track the ongoing pulse and return `None`.
+    ///
+    /// 3. **Pulse starts in the current input sample but not completed**:
+    ///    - A pulse begins and ends entirely within the current batch.
+    ///    - The function will return the completed `Pulse` and its end index.
+    ///
+    /// 4. **Pulse started from a previous sample**:
+    ///    - The function resumes tracking a pulse started in a previous batch (`self.progress`
+    ///      is already set).
+    ///    - If the pulse ends in the current batch, it will return the completed `Pulse`.
+    ///    - If the pulse does not end, the function will update `self.progress` and return `None`.
+    pub fn process_new_samples(&mut self, samples: &[f32]) -> Option<(Pulse, usize)> {
+        let mut start = 0;
+
+        // If no pulse is in progress, look for the start of a new pulse
+        if self.progress.is_none() {
+            for (i, &val) in samples.iter().enumerate() {
+                let y = self.filter.apply(val * val); // Square input to compute energy
+                if y > self.threshold {
+                    self.progress = Some(Pulse {
+                        energy: y,
+                        duration: 0,
+                        max_amplitude: y,
+                        max_time_index: 0,
+                    });
+                    start = i + 1; // Start processing the next samples
+                    break;
+                }
+            }
+        }
+
+        if let Some(mut progress) = self.progress.take() {
+            for i in start..samples.len() {
+                let y = self.filter.apply(samples[i] * samples[i]);
+                progress.energy += y;
+                progress.duration += 1;
+
+                // End the pulse if energy falls below the threshold
+                if y < self.threshold {
+                    self.progress = None;
+                    return Some((progress, i));
+                }
+
+                // Update max amplitude if necessary
+                if y > progress.max_amplitude {
+                    progress.max_amplitude = y;
+                    progress.max_time_index = progress.duration;
+                }
+            }
+            // If the pulse is still in progress, reassign it back to self.progress
+            self.progress = Some(progress);
+        }
+
+        None
+    }
+}
 
 /// A fixed-size circular buffer
 /// - `buffer`: The underlying storage for the circular buffer.
@@ -196,6 +344,7 @@ pub fn start_audio_processing(device_name: String, pitch_tx: Sender<Option<f32>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_approx_eq::assert_approx_eq;
 
     #[test]
     fn test_new() {
@@ -263,5 +412,68 @@ mod tests {
 
         let mut output = vec![0.0; 4]; // Incorrect size
         buffer.copy_to_buffer(&mut output);
+    }
+
+    #[test]
+    fn test_single_pulse() {
+        let sample_rate = 44100;
+        let cutoff_frequency = sample_rate as f32;
+        let threshold = 0.01;
+
+        let mut detector = PulseDetector::new(sample_rate, cutoff_frequency, threshold);
+
+        // Simulated signal with one pulse
+        let samples = vec![
+            0.0, 0.0, 0.0, 0.2, 0.5, 1.0, 0.5, 0.2, 0.0, 0.0, 0.0, // Single pulse
+        ];
+
+        if let Some((pulse, _)) = detector.process_new_samples(&samples) {
+            assert!(pulse.energy > 0.1, "Energy should be above threshold");
+            assert_eq!(pulse.duration, 6, "Pulse duration should be 6 samples");
+            assert_approx_eq!(pulse.max_amplitude, 0.8930, 1e-3);
+        } else {
+            panic!("No pulse detected when one was expected.");
+        }
+    }
+
+    #[test]
+    fn test_multiple_pulses() {
+        let sample_rate = 44100;
+        let cutoff_frequency = sample_rate as f32;
+        let threshold = 0.01;
+
+        let mut detector = PulseDetector::new(sample_rate, cutoff_frequency, threshold);
+
+        // Simulated signal with one pulse
+        let samples = vec![
+            0.0, 0.0, 0.0, 0.2, 0.5, 1.0, 0.5, 0.2, 0.0, 0.0, 0.0, // first pulse
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // filler
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // filler
+            0.0, 0.0, 0.0, 0.2, 0.5, 1.0, 0.5, 0.2, 0.0, 0.0, 0.0, // second pulse
+        ];
+
+        // Detect the first pulse
+        if let Some((pulse, end_index)) = detector.process_new_samples(&samples) {
+            assert!(pulse.energy > 0.1, "Energy should be above threshold");
+            assert_eq!(
+                pulse.duration, 6,
+                "First pulse duration should be 6 samples"
+            );
+            assert_approx_eq!(pulse.max_amplitude, 0.8930, 1e-3);
+
+            // Detect the second pulse
+            if let Some((pulse, _)) = detector.process_new_samples(&samples[end_index + 1..]) {
+                assert!(pulse.energy > 0.1, "Energy should be above threshold");
+                assert_eq!(
+                    pulse.duration, 6,
+                    "Second pulse duration should be 7 samples"
+                );
+                assert_approx_eq!(pulse.max_amplitude, 0.8930, 1e-3);
+            } else {
+                panic!("Second pulse not detected.");
+            }
+        } else {
+            panic!("First pulse not detected.");
+        }
     }
 }
