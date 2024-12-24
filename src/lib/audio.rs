@@ -1,46 +1,11 @@
+use crate::filters::Lowpass;
 use crate::tuner::{identify_frequency, Resonators};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::f32::consts::PI;
 use std::sync::mpsc::Sender;
 use std::{
     sync::{Arc, Mutex},
     thread,
 };
-
-/// A single-pole IIR lowpass filter.
-struct Lowpass {
-    alpha: f32,
-
-    y_1: f32, // internal state to store the previous output
-}
-
-impl Lowpass {
-    /// Creates a new lowpass filter.
-    ///
-    /// # Arguments
-    /// * `sample_rate` - The sampling rate of the input signal in Hz.
-    /// * `cutoff_frequency` - The cutoff frequency for the lowpass filter in Hz.
-    pub fn new(sample_rate: usize, cutoff_frequency: f32) -> Self {
-        let omega = 2.0 * PI * cutoff_frequency / sample_rate as f32;
-        let alpha = omega / (omega + 1.0);
-
-        Lowpass { alpha, y_1: 0.0 }
-    }
-
-    /// Applies the lowpass filter to a single sample.
-    ///
-    /// # Arguments
-    /// * `x` - The current input sample.
-    ///
-    /// # Returns
-    /// The filtered output.
-    pub fn apply(&mut self, x: f32) -> f32 {
-        let y = self.y_1 + self.alpha * (x - self.y_1);
-        self.y_1 = y;
-
-        y
-    }
-}
 
 /// Represents a detected pulse in the input signal.
 #[derive(Clone, Copy)]
@@ -53,7 +18,7 @@ pub struct Pulse {
 
 /// Detects pulses in an audio signal based on energy thresholding.
 pub struct PulseDetector {
-    filter: Lowpass,
+    filter: Lowpass<f32>,
     threshold: f32,
     progress: Option<Pulse>,
 }

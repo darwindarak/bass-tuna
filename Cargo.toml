@@ -18,6 +18,7 @@ path = "src/lib/mod.rs"
 [dependencies]
 cpal = "0.15.3"
 crossterm = "0.28.1"
+num-traits = "0.2.19"
 ratatui = "0.29.0"
 
 [dev-dependencies]
