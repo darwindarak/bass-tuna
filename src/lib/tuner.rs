@@ -276,8 +276,8 @@ mod tests {
         let dt = 1.0 / fs;
 
         // Add the fundamental frequency
-        for i in 0..num_samples {
-            signal[i] += (2.0 * PI * f * i as f32 * dt).sin();
+        for (i, x) in signal.iter_mut().enumerate().take(num_samples) {
+            *x += (2.0 * PI * f * i as f32 * dt).sin();
         }
 
         // Add harmonics

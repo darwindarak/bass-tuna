@@ -1,15 +1,13 @@
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossbeam_channel::{after, select, unbounded, Sender};
-use lib::audio::{
-    get_input_device, start_audio_processing, LowpassBlock, PitchDetectorBlock, PulseDetectorBlock,
-};
+use lib::audio::{Block, InputBlock, LowpassBlock, PitchDetectorBlock, PulseDetectorBlock};
 use lib::tuner::identify_note_name;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Span,
-    widgets::{Block, Borders, List, ListItem, Paragraph, Widget},
+    widgets::{self, Borders, List, ListItem, Paragraph, Widget},
     Frame,
 };
 use std::collections::HashMap;
@@ -22,7 +20,7 @@ pub struct RulerWidget<'a> {
     pub major_cents: f32,
     pub n_major: i32,
     pub n_minor: i32,
-    pub block: Option<Block<'a>>, // Optional block for borders and titles
+    pub block: Option<widgets::Block<'a>>, // Optional block for borders and titles
 }
 
 fn build_ascii_map() -> HashMap<char, &'static str> {
@@ -152,7 +150,7 @@ fn build_ascii_map() -> HashMap<char, &'static str> {
     map
 }
 
-impl<'a> Widget for RulerWidget<'a> {
+impl Widget for RulerWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Draw the block (if provided)
         if let Some(block) = &self.block {
@@ -273,26 +271,23 @@ impl<'a> Widget for RulerWidget<'a> {
                 let label = format!("{:+}", (i / self.n_minor) as f32 * self.major_cents);
                 let label_start = label.len() / 2;
                 for (i, c) in label.chars().enumerate() {
-                    let label_x =
-                        (inner_area.x + x as u16).saturating_sub(label_start as u16) + i as u16;
+                    let label_x = (inner_area.x + x).saturating_sub(label_start as u16) + i as u16;
                     if label_x < inner_area.x + inner_area.width {
                         buf[(label_x, inner_area.y + letter_height + 4)]
                             .set_char(c)
                             .set_style(Style::default().fg(Color::White));
                     }
                 }
-            } else {
-                if i == marker_center {
-                    for y in [1, 3] {
-                        buf[(inner_area.x + x, inner_area.y + y + letter_height)]
-                            .set_char('🮋')
-                            .set_style(Style::default().fg(color));
-                    }
-                } else {
-                    buf[(inner_area.x + x, inner_area.y + 3 + letter_height)]
-                        .set_char('┊')
-                        .set_style(Style::default().fg(Color::Gray));
+            } else if i == marker_center {
+                for y in [1, 3] {
+                    buf[(inner_area.x + x, inner_area.y + y + letter_height)]
+                        .set_char('🮋')
+                        .set_style(Style::default().fg(color));
                 }
+            } else {
+                buf[(inner_area.x + x, inner_area.y + 3 + letter_height)]
+                    .set_char('┊')
+                    .set_style(Style::default().fg(Color::Gray));
             }
         }
     }
@@ -353,56 +348,49 @@ pub fn update(model: &mut Model, msg: Message, state_sender: &Sender<AppState>) 
             let device_name = model.devices[model.selected_device].clone();
             model.state = AppState::PitchDisplay { pitch: None };
 
-            let device = get_input_device(device_name).expect("Cannot get input device");
-            let config = device
-                .default_input_config()
-                .expect("Cannot get device configuration");
-
-            let (device_lowpass_sender, device_lowpass_receiver) = unbounded();
-            let (device_pitch_sender, device_pitch_receiver) = unbounded();
-            let (lowpass_pulse_sender, lowpass_pulse_receiver) = unbounded();
             let (pitch_ui_sender, pitch_ui_receiver) = unbounded();
             let (pulse_ui_sender, pulse_ui_receiver) = unbounded();
 
-            let candidate_frequencies: Vec<f32> = (1..=24)
-                .into_iter()
-                .map(|n| 36.70810 * 2.0f32.powf(n as f32 / 12.0))
-                .collect();
-            let sample_rate = config.sample_rate().0 as usize;
-            let window_size = sample_rate / 10;
+            let mut input_block = InputBlock::new(&device_name);
 
-            let pitch_detector = PitchDetectorBlock {
+            let sample_rate = input_block.config.sample_rate().0 as usize;
+            let window_size = sample_rate / 10;
+            let candidate_frequencies: Vec<f32> = (1..=24)
+                .map(|n| 36.7081 * 2.0f32.powf(n as f32 / 12.0))
+                .collect();
+            let update_interval = 100;
+            let mut pitch_detector = PitchDetectorBlock::new(
                 candidate_frequencies,
                 sample_rate,
                 window_size,
-                update_interval: 150,
-                source: device_pitch_receiver,
-                output: vec![pitch_ui_sender],
-            };
+                update_interval,
+            );
+
+            let mut lowpass = LowpassBlock::new(10.0, sample_rate, |x| x * x);
+            let mut pulse_detector = PulseDetectorBlock::new(1e-2);
+
+            input_block.pipe_output_to(&mut pitch_detector);
+            input_block.pipe_output_to(&mut lowpass);
+
+            pitch_detector.add_output(pitch_ui_sender);
+
+            lowpass.pipe_output_to(&mut pulse_detector);
+            pulse_detector.add_output(pulse_ui_sender);
+
             pitch_detector.run();
-
-            let lowpass = LowpassBlock {
-                cutoff_frequency: 10.0,
-                sample_rate,
-                source: device_lowpass_receiver,
-                output: vec![lowpass_pulse_sender],
-                transform: |x| x * x,
-            };
             lowpass.run();
-
-            let pulse_detector = PulseDetectorBlock {
-                threshold: 1e-2,
-                source: lowpass_pulse_receiver,
-                output: vec![pulse_ui_sender],
-            };
             pulse_detector.run();
+
+            input_block.run();
+
+            //start_audio_processing(device, vec![device_pitch_sender, device_lowpass_sender]);
 
             let state_sender = state_sender.clone();
 
             thread::spawn(move || {
                 let mut identified_pitch = None;
                 loop {
-                    let timeout = Duration::from_millis(100);
+                    let timeout = Duration::from_millis(50);
                     select! {
                         recv(after(timeout)) -> _ => {
                             state_sender.send(AppState::PitchDisplay{pitch: identified_pitch}).unwrap();
@@ -416,8 +404,6 @@ pub fn update(model: &mut Model, msg: Message, state_sender: &Sender<AppState>) 
                     }
                 }
             });
-
-            start_audio_processing(device, vec![device_pitch_sender, device_lowpass_sender]);
         }
         Message::UpdateState(update) => {
             model.state = update;
@@ -443,8 +429,11 @@ fn draw_device_selection(frame: &mut Frame, model: &Model) {
         .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
         .split(frame.area());
 
-    let header = Paragraph::new("Select an Input Device")
-        .block(Block::default().borders(Borders::ALL).title("Tuna"));
+    let header = Paragraph::new("Select an Input Device").block(
+        widgets::Block::default()
+            .borders(Borders::ALL)
+            .title("Tuna"),
+    );
     frame.render_widget(header, chunks[0]);
 
     let items: Vec<ListItem> = model
@@ -463,7 +452,11 @@ fn draw_device_selection(frame: &mut Frame, model: &Model) {
         })
         .collect();
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Devices"));
+    let list = List::new(items).block(
+        widgets::Block::default()
+            .borders(Borders::ALL)
+            .title("Devices"),
+    );
     frame.render_widget(list, chunks[1]);
 }
 
@@ -485,7 +478,11 @@ fn draw_pitch_display(frame: &mut Frame, model: &Model) {
     let widget = RulerWidget {
         current_cents,
         detected_note,
-        block: Some(Block::default().borders(Borders::ALL).title("Tuna")),
+        block: Some(
+            widgets::Block::default()
+                .borders(Borders::ALL)
+                .title("Tuna"),
+        ),
         major_cents: 5.0,
         n_major: 5,
         n_minor: 5,

@@ -15,21 +15,14 @@ fn main() -> io::Result<()> {
     loop {
         terminal.draw(|f| view(f, &model)).ok();
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Ok(event) = event::read() {
-                match event {
-                    Event::Key(key_event) => match key_event.code {
-                        KeyCode::Up => {
-                            update(&mut model, Message::SelectPreviousDevice, &state_sender)
-                        }
-                        KeyCode::Down => {
-                            update(&mut model, Message::SelectNextDevice, &state_sender)
-                        }
-                        KeyCode::Enter => update(&mut model, Message::ConfirmDevice, &state_sender),
-                        KeyCode::Esc => update(&mut model, Message::Exit, &state_sender),
-                        KeyCode::Char('q') => update(&mut model, Message::Exit, &state_sender),
-                        _ => {}
-                    },
+        if event::poll(Duration::from_millis(50))? {
+            if let Ok(Event::Key(key_event)) = event::read() {
+                match key_event.code {
+                    KeyCode::Up => update(&mut model, Message::SelectPreviousDevice, &state_sender),
+                    KeyCode::Down => update(&mut model, Message::SelectNextDevice, &state_sender),
+                    KeyCode::Enter => update(&mut model, Message::ConfirmDevice, &state_sender),
+                    KeyCode::Esc => update(&mut model, Message::Exit, &state_sender),
+                    KeyCode::Char('q') => update(&mut model, Message::Exit, &state_sender),
                     _ => {}
                 }
             }

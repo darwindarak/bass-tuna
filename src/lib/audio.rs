@@ -1,7 +1,7 @@
 use crate::filters::Lowpass;
 use crate::tuner::{identify_frequency, Resonators};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::time::{Duration, Instant};
 use std::{
     sync::{Arc, Mutex},
@@ -19,27 +19,135 @@ pub struct Pulse {
 
 pub struct PulseDetectorBlock {
     pub threshold: f32,
-    pub source: Receiver<(u128, Arc<Vec<f32>>)>,
-    pub output: Vec<Sender<Pulse>>,
+    source: Option<Receiver<(u128, Arc<Vec<f32>>)>>,
+    output: Vec<Sender<Pulse>>,
+}
+
+pub trait Block {
+    type InputData;
+    type OutputData;
+
+    fn set_source(&mut self, receiver: Receiver<Self::InputData>);
+    fn add_output(&mut self, sender: Sender<Self::OutputData>);
+    fn pipe_output_to<B>(&mut self, downstream: &mut B)
+    where
+        B: Block<InputData = Self::OutputData>,
+    {
+        let (sender, receiver) = unbounded();
+        self.add_output(sender);
+        downstream.set_source(receiver);
+    }
+}
+
+pub struct InputBlock {
+    pub device_name: String,
+    pub device: cpal::Device,
+    pub config: cpal::SupportedStreamConfig,
+    output: Vec<Sender<(u128, Arc<Vec<f32>>)>>,
+}
+
+impl Block for InputBlock {
+    type InputData = ();
+    type OutputData = (u128, Arc<Vec<f32>>);
+
+    fn set_source(&mut self, _receiver: Receiver<Self::InputData>) {}
+
+    fn add_output(&mut self, sender: Sender<Self::OutputData>) {
+        self.output.push(sender);
+    }
+}
+
+impl InputBlock {
+    pub fn new(device_name: &str) -> Self {
+        let host = cpal::default_host();
+        let device = host
+            .input_devices()
+            .unwrap()
+            .find(|d| d.name().unwrap_or_default() == device_name)
+            .unwrap();
+        let config = device.default_input_config().unwrap();
+
+        Self {
+            device_name: device_name.into(),
+            device,
+            config,
+            output: vec![],
+        }
+    }
+
+    pub fn run(&self) {
+        let device = self.device.clone();
+        let outputs = self.output.clone();
+        let config = self.config.clone();
+
+        thread::spawn(move || {
+            let channels = config.channels() as usize;
+
+            let now = Instant::now();
+
+            let stream = device
+                .build_input_stream(
+                    &config.into(),
+                    move |data: &[f32], _: &_| {
+                        let timestamp = Instant::now().duration_since(now).as_nanos();
+                        let mono_chunk: Vec<f32> = data
+                            .chunks(channels)
+                            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                            .collect();
+
+                        let buffer = Arc::new(mono_chunk);
+                        for listener in &outputs {
+                            listener.send((timestamp, buffer.clone())).unwrap();
+                        }
+                    },
+                    |err| eprintln!("Stream error: {}", err),
+                    None,
+                )
+                .unwrap();
+
+            stream.play().unwrap();
+        });
+    }
+}
+
+impl Block for PulseDetectorBlock {
+    type InputData = (u128, Arc<Vec<f32>>);
+    type OutputData = Pulse;
+
+    fn set_source(&mut self, receiver: Receiver<Self::InputData>) {
+        self.source = Some(receiver);
+    }
+
+    fn add_output(&mut self, sender: Sender<Self::OutputData>) {
+        self.output.push(sender);
+    }
 }
 
 impl PulseDetectorBlock {
+    pub fn new(threshold: f32) -> Self {
+        Self {
+            threshold,
+            source: None,
+            output: vec![],
+        }
+    }
+
     pub fn run(&self) {
-        let threshold = self.threshold;
+        if let Some(source) = self.source.clone() {
+            let threshold = self.threshold;
+            let listeners = self.output.clone();
 
-        let source = self.source.clone();
-        let listeners = self.output.clone();
-
-        thread::spawn(move || {
-            let mut detector = PulseDetector::new(threshold);
-            while let Ok((_timestamp, sample)) = source.recv() {
-                if let Some((pulse, _start)) = detector.process_new_samples(&sample) {
-                    for listener in &listeners {
-                        listener.send(pulse).unwrap();
+            thread::spawn(move || {
+                let mut detector = PulseDetector::new(threshold);
+                while let Ok((_timestamp, sample)) = source.recv() {
+                    if let Some((pulse, _start)) = detector.process_new_samples(&sample) {
+                        for listener in &listeners {
+                            listener.send(pulse).unwrap();
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
 }
 
@@ -233,38 +341,76 @@ impl CircularBuffer {
         result
     }
 }
+
+impl Block for LowpassBlock {
+    type InputData = (u128, Arc<Vec<f32>>);
+    type OutputData = (u128, Arc<Vec<f32>>);
+
+    fn set_source(&mut self, receiver: Receiver<Self::InputData>) {
+        self.source = Some(receiver);
+    }
+
+    fn add_output(&mut self, sender: Sender<Self::OutputData>) {
+        self.output.push(sender);
+    }
+}
+
 pub struct LowpassBlock {
     pub cutoff_frequency: f32,
     pub sample_rate: usize,
     pub transform: fn(f32) -> f32,
-    pub source: Receiver<(u128, Arc<Vec<f32>>)>,
-    pub output: Vec<Sender<(u128, Arc<Vec<f32>>)>>,
+    source: Option<Receiver<(u128, Arc<Vec<f32>>)>>,
+    output: Vec<Sender<(u128, Arc<Vec<f32>>)>>,
 }
 
 impl LowpassBlock {
+    pub fn new(cutoff_frequency: f32, sample_rate: usize, transform: fn(f32) -> f32) -> Self {
+        Self {
+            cutoff_frequency,
+            sample_rate,
+            transform,
+            source: None,
+            output: vec![],
+        }
+    }
+
     pub fn run(&self) {
-        let source = self.source.clone();
-        let sample_rate = self.sample_rate;
-        let cutoff_frequency = self.cutoff_frequency;
+        if let Some(source) = self.source.clone() {
+            let sample_rate = self.sample_rate;
+            let cutoff_frequency = self.cutoff_frequency;
 
-        let listeners = self.output.clone();
-        let transform = self.transform;
+            let listeners = self.output.clone();
+            let transform = self.transform;
 
-        thread::spawn(move || {
-            let mut filter = Lowpass::new(sample_rate, cutoff_frequency);
-            while let Ok((timestamp, packet)) = source.recv() {
-                let mut buffer = vec![0.0; packet.len()];
-                for (i, &x) in packet.iter().enumerate() {
-                    buffer[i] = filter.apply(transform(x));
+            thread::spawn(move || {
+                let mut filter = Lowpass::new(sample_rate, cutoff_frequency);
+                while let Ok((timestamp, packet)) = source.recv() {
+                    let mut buffer = vec![0.0; packet.len()];
+                    for (i, &x) in packet.iter().enumerate() {
+                        buffer[i] = filter.apply(transform(x));
+                    }
+
+                    let buffer = Arc::new(buffer);
+
+                    for listener in &listeners {
+                        listener.send((timestamp, Arc::clone(&buffer))).unwrap();
+                    }
                 }
+            });
+        }
+    }
+}
 
-                let buffer = Arc::new(buffer);
+impl Block for PitchDetectorBlock {
+    type InputData = (u128, Arc<Vec<f32>>);
+    type OutputData = Option<f32>;
 
-                for listener in &listeners {
-                    listener.send((timestamp, Arc::clone(&buffer))).unwrap();
-                }
-            }
-        });
+    fn set_source(&mut self, receiver: Receiver<Self::InputData>) {
+        self.source = Some(receiver);
+    }
+
+    fn add_output(&mut self, sender: Sender<Self::OutputData>) {
+        self.output.push(sender);
     }
 }
 
@@ -273,75 +419,92 @@ pub struct PitchDetectorBlock {
     pub sample_rate: usize,
     pub window_size: usize,
     pub update_interval: u64,
-    pub source: Receiver<(u128, Arc<Vec<f32>>)>,
-    pub output: Vec<Sender<Option<f32>>>,
+    source: Option<Receiver<(u128, Arc<Vec<f32>>)>>,
+    output: Vec<Sender<Option<f32>>>,
 }
 
 impl PitchDetectorBlock {
+    pub fn new(
+        candidate_frequencies: Vec<f32>,
+        sample_rate: usize,
+        window_size: usize,
+        update_interval: u64,
+    ) -> Self {
+        Self {
+            candidate_frequencies,
+            sample_rate,
+            window_size,
+            update_interval,
+            source: None,
+            output: vec![],
+        }
+    }
+
     pub fn run(&self) {
-        let source = self.source.clone();
-        let sample_rate = self.sample_rate;
-        let candidate_frequencies = self.candidate_frequencies.clone();
+        if let Some(source) = self.source.clone() {
+            let sample_rate = self.sample_rate;
+            let candidate_frequencies = self.candidate_frequencies.clone();
 
-        let buffer = Arc::new(Mutex::new(CircularBuffer::new(self.window_size)));
-        let buffer_reader = Arc::clone(&buffer);
+            let buffer = Arc::new(Mutex::new(CircularBuffer::new(self.window_size)));
+            let buffer_reader = Arc::clone(&buffer);
 
-        let resonators = Arc::new(Mutex::new(Resonators::new(
-            &candidate_frequencies,
-            sample_rate as i32,
-            10.0,
-            sample_rate / 20,
-        )));
-        let resonators_reader = Arc::clone(&resonators);
+            let resonators = Arc::new(Mutex::new(Resonators::new(
+                &candidate_frequencies,
+                sample_rate as i32,
+                10.0,
+                sample_rate / 20,
+            )));
+            let resonators_reader = Arc::clone(&resonators);
 
-        thread::spawn(move || {
-            while let Ok((_timestamp, packet)) = source.recv() {
-                buffer.lock().unwrap().add_chunk(&packet);
-                resonators.lock().unwrap().process_new_samples(&packet);
-            }
-        });
+            thread::spawn(move || {
+                while let Ok((_timestamp, packet)) = source.recv() {
+                    buffer.lock().unwrap().add_chunk(&packet);
+                    resonators.lock().unwrap().process_new_samples(&packet);
+                }
+            });
 
-        let update_interval = self.update_interval;
-        let listeners = self.output.clone();
-        let max_window = self.window_size;
+            let update_interval = self.update_interval;
+            let listeners = self.output.clone();
+            let max_window = self.window_size;
 
-        thread::spawn(move || {
-            let mut work_buffer = vec![0.0; max_window];
-            loop {
-                let (f_candidate, _) = resonators_reader.lock().unwrap().current_peak();
-                buffer_reader
-                    .lock()
-                    .unwrap()
-                    .copy_to_buffer(&mut work_buffer);
+            thread::spawn(move || {
+                let mut work_buffer = vec![0.0; max_window];
+                loop {
+                    let (f_candidate, _) = resonators_reader.lock().unwrap().current_peak();
+                    buffer_reader
+                        .lock()
+                        .unwrap()
+                        .copy_to_buffer(&mut work_buffer);
 
-                let mut pitch = identify_frequency(
-                    &work_buffer,
-                    sample_rate as f32,
-                    f_candidate - 5.0,
-                    f_candidate + 5.0,
-                    true,
-                );
-
-                // Sometimes the 2nd harmonic is more energetic than the fundamental frequency
-                // but it's not enough to trigger detection via autocorrelation.  So we will
-                // also check the half-frequency to see if it's a match
-                if pitch.is_none() {
-                    pitch = identify_frequency(
+                    let mut pitch = identify_frequency(
                         &work_buffer,
                         sample_rate as f32,
-                        0.5 * f_candidate - 5.0,
-                        0.5 * f_candidate + 5.0,
+                        f_candidate - 5.0,
+                        f_candidate + 5.0,
                         true,
                     );
-                }
 
-                for listener in &listeners {
-                    listener.send(pitch).unwrap();
-                }
+                    // Sometimes the 2nd harmonic is more energetic than the fundamental frequency
+                    // but it's not enough to trigger detection via autocorrelation.  So we will
+                    // also check the half-frequency to see if it's a match
+                    if pitch.is_none() {
+                        pitch = identify_frequency(
+                            &work_buffer,
+                            sample_rate as f32,
+                            0.5 * f_candidate - 5.0,
+                            0.5 * f_candidate + 5.0,
+                            true,
+                        );
+                    }
 
-                thread::sleep(Duration::from_millis(update_interval));
-            }
-        });
+                    for listener in &listeners {
+                        listener.send(pitch).unwrap();
+                    }
+
+                    thread::sleep(Duration::from_millis(update_interval));
+                }
+            });
+        }
     }
 }
 
