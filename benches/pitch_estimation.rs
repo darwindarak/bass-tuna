@@ -9,14 +9,14 @@ use lib::tuner::{identify_frequency, Resonators};
 /// - `duration` is the signal length in seconds.
 /// - `fs` is the sampling rate in Hz.
 /// - `harmonics` is the number of additional harmonics to include.
-fn generate_sine_with_harmonics(f: f32, duration: f32, fs: f32, harmonics: usize) -> Vec<f32> {
-    let num_samples = (duration * fs) as usize;
+fn generate_sine_with_harmonics(f: f32, duration: usize, fs: usize, harmonics: usize) -> Vec<f32> {
+    let num_samples = duration * fs;
     let mut signal = vec![0.0; num_samples];
-    let dt = 1.0 / fs;
+    let dt = 1.0 / (fs as f32);
 
     // Add the fundamental frequency
-    for i in 0..num_samples {
-        signal[i] += (2.0 * PI * f * i as f32 * dt).sin();
+    for (i, y) in signal.iter_mut().enumerate().take(num_samples) {
+        *y += (2.0 * PI * f * i as f32 * dt).sin();
     }
 
     // Add harmonics
@@ -24,9 +24,8 @@ fn generate_sine_with_harmonics(f: f32, duration: f32, fs: f32, harmonics: usize
     for _ in 0..harmonics {
         let amplitude = rng.gen_range(0.2..1.0); // Random amplitude for harmonics
         let harmonic_multiplier = rng.gen_range(2..6); // Random integer multiple of the fundamental
-        for i in 0..num_samples {
-            signal[i] +=
-                amplitude * (2.0 * PI * f * harmonic_multiplier as f32 * i as f32 * dt).sin();
+        for (i, y) in signal.iter_mut().enumerate().take(num_samples) {
+            *y += amplitude * (2.0 * PI * f * harmonic_multiplier as f32 * i as f32 * dt).sin();
         }
     }
 
@@ -34,8 +33,8 @@ fn generate_sine_with_harmonics(f: f32, duration: f32, fs: f32, harmonics: usize
 }
 
 pub fn criterion_benchmark(c: &mut Criterion) {
-    let fs = 44100.0; // Sampling rate in Hz
-    let duration = 1.0; // Signal duration in seconds
+    let fs = 44100; // Sampling rate in Hz
+    let duration = 1; // Signal duration in seconds
     let min_frequency = 30.0;
     let max_frequency = 150.0;
 
@@ -50,9 +49,9 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let mut resonators = Resonators::new(
                 &[30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0],
-                fs as i32,
+                fs,
                 10.0,
-                fs as usize / 20,
+                fs / 20,
             );
             resonators.process_new_samples(&signal);
             let (freq, _) = resonators.current_peak();

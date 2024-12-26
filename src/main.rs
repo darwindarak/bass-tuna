@@ -1,6 +1,5 @@
 mod tui;
-use crate::tui::{update, view, AppState, Message, Model};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crate::tui::{update, view, Message, Model};
 use ratatui::crossterm::event::{self, Event, KeyCode};
 use std::io::{self};
 use std::time::Duration;
@@ -8,8 +7,6 @@ use std::time::Duration;
 fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
     terminal.clear()?;
-
-    let (state_sender, state_receiver): (Sender<AppState>, Receiver<AppState>) = unbounded();
     let mut model = Model::new();
 
     loop {
@@ -18,18 +15,14 @@ fn main() -> io::Result<()> {
         if event::poll(Duration::from_millis(50))? {
             if let Ok(Event::Key(key_event)) = event::read() {
                 match key_event.code {
-                    KeyCode::Up => update(&mut model, Message::SelectPreviousDevice, &state_sender),
-                    KeyCode::Down => update(&mut model, Message::SelectNextDevice, &state_sender),
-                    KeyCode::Enter => update(&mut model, Message::ConfirmDevice, &state_sender),
-                    KeyCode::Esc => update(&mut model, Message::Exit, &state_sender),
-                    KeyCode::Char('q') => update(&mut model, Message::Exit, &state_sender),
+                    KeyCode::Up => update(&mut model, Message::SelectPreviousDevice),
+                    KeyCode::Down => update(&mut model, Message::SelectNextDevice),
+                    KeyCode::Enter => update(&mut model, Message::ConfirmDevice),
+                    KeyCode::Esc => update(&mut model, Message::Exit),
+                    KeyCode::Char('q') => update(&mut model, Message::Exit),
                     _ => {}
                 }
             }
-        }
-
-        if let Ok(state) = state_receiver.try_recv() {
-            update(&mut model, Message::UpdateState(state), &state_sender);
         }
     }
 }

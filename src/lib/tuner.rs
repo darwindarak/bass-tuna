@@ -1,9 +1,9 @@
-use std::f32::consts::PI;
+use crate::filters::BiquadFilter;
 
 /// A collection of resonators tuned to specific frequencies.
 pub struct Resonators {
     frequencies: Vec<f32>,           // Target frequencies for the resonators
-    filters: Vec<BiquadFilter>,      // Filters tuned to the target frequencies
+    filters: Vec<BiquadFilter<f32>>, // Filters tuned to the target frequencies
     energy_histories: Vec<Vec<f32>>, // Historical energy values for each filter
     energies: Vec<f32>,              // Current energy levels for each filter
     n_energy_history: usize,         // Number of historical energy samples to track
@@ -18,8 +18,8 @@ impl Resonators {
     /// * `sample_rate` - The sample rate of the audio in Hz.
     /// * `q` - The quality factor for the resonators.
     /// * `n_energy_history` - The size of the energy history buffer.
-    pub fn new(frequencies: &[f32], sample_rate: i32, q: f32, n_energy_history: usize) -> Self {
-        let filters: Vec<BiquadFilter> = frequencies
+    pub fn new(frequencies: &[f32], sample_rate: usize, q: f32, n_energy_history: usize) -> Self {
+        let filters: Vec<BiquadFilter<f32>> = frequencies
             .iter()
             .map(|&f| BiquadFilter::new(f, sample_rate, q))
             .collect();
@@ -70,78 +70,6 @@ impl Resonators {
     }
 }
 
-/// A biquad filter implementation for resonator filtering.
-struct BiquadFilter {
-    b_0: f32, // Feedforward coefficient
-    b_1: f32,
-    b_2: f32,
-    a_1: f32, // Feedback coefficient
-    a_2: f32,
-
-    y_1: f32, // Previous output sample (y[n-1])
-    y_2: f32, // Output sample (y[n-2])
-    x_1: f32, // Previous input sample (x[n-1])
-    x_2: f32, // Input sample (x[n-2])
-}
-
-impl BiquadFilter {
-    /// Applies the filter to a single input sample and returns the output sample.
-    ///
-    /// # Arguments
-    /// * `x` - The input sample.
-    ///
-    /// # Returns
-    /// The filtered output sample.
-    fn apply(&mut self, x: f32) -> f32 {
-        let y = self.b_0 * x + self.b_1 * self.x_1 + self.b_2 * self.x_2
-            - self.a_1 * self.y_1
-            - self.a_2 * self.y_2;
-
-        // Update state variables
-        self.y_2 = self.y_1;
-        self.y_1 = y;
-        self.x_2 = self.x_1;
-        self.x_1 = x;
-
-        y
-    }
-
-    /// Creates a new biquad filter tuned to a specific frequency.
-    ///
-    /// # Arguments
-    /// * `f0` - The target frequency in Hz.
-    /// * `sample_rate` - The sample rate of the audio in Hz.
-    /// * `q` - The quality factor of the filter.
-    ///
-    /// # Returns
-    /// A new `BiquadFilter` instance.
-    pub fn new(f0: f32, sample_rate: i32, q: f32) -> Self {
-        let k = f0 / sample_rate as f32;
-        let omega_0 = 2.0 * PI * k;
-        let alpha = omega_0.sin() / (2.0 * q);
-
-        let a_0 = 1.0 + alpha;
-        let a_1 = -2.0 * omega_0.cos() / a_0;
-        let a_2 = (1.0 - alpha) / a_0;
-
-        let b_0 = alpha / a_0;
-        let b_1 = 0.0;
-        let b_2 = -b_0;
-
-        Self {
-            b_0,
-            b_1,
-            b_2,
-            a_1,
-            a_2,
-            y_1: 0.0,
-            y_2: 0.0,
-            x_1: 0.0,
-            x_2: 0.0,
-        }
-    }
-}
-
 /// Identifies the musical note name, pitch, and cents offset for a given frequency.
 ///
 /// # Arguments
@@ -170,7 +98,7 @@ pub fn identify_note_name(f: f32) -> (String, f32, f32) {
         9 => "F",
         10 => "Gb",
         11 => "G",
-        _ => panic!("Unexpected note number: {}", n),
+        _ => " ",
     }
     .to_string();
 
@@ -196,7 +124,7 @@ pub fn identify_note_name(f: f32) -> (String, f32, f32) {
 ///
 pub fn identify_frequency(
     input: &[f32],
-    sample_rate: f32,
+    sample_rate: usize,
     min_frequency: f32,
     max_frequency: f32,
     interpolate: bool,
@@ -212,8 +140,8 @@ pub fn identify_frequency(
     }
 
     // Calculate the difference function d(t)
-    let min_period = (sample_rate / max_frequency).floor() as usize;
-    let max_period = (sample_rate / min_frequency).floor() as usize;
+    let min_period = (sample_rate as f32 / max_frequency).floor() as usize;
+    let max_period = (sample_rate as f32 / min_frequency).floor() as usize;
 
     let mut differences: Vec<f32> = vec![0.0; (max_period - min_period) + 1];
     for (i, period) in (min_period..=max_period).enumerate() {
@@ -252,7 +180,7 @@ pub fn identify_frequency(
             };
 
             // Convert period to frequency
-            return Some(sample_rate / period);
+            return Some(sample_rate as f32 / period);
         }
     }
     None
@@ -270,10 +198,15 @@ mod tests {
     /// - `duration` is the signal length in seconds.
     /// - `fs` is the sampling rate in Hz.
     /// - `harmonics` is the number of additional harmonics to include.
-    fn generate_sine_with_harmonics(f: f32, duration: f32, fs: f32, harmonics: usize) -> Vec<f32> {
-        let num_samples = (duration * fs) as usize;
+    fn generate_sine_with_harmonics(
+        f: f32,
+        duration: usize,
+        fs: usize,
+        harmonics: usize,
+    ) -> Vec<f32> {
+        let num_samples = duration * fs;
         let mut signal = vec![0.0; num_samples];
-        let dt = 1.0 / fs;
+        let dt = 1.0 / fs as f32;
 
         // Add the fundamental frequency
         for (i, x) in signal.iter_mut().enumerate().take(num_samples) {
@@ -285,9 +218,8 @@ mod tests {
         for _ in 0..harmonics {
             let amplitude = rng.gen_range(0.1..0.3); // Random amplitude for harmonics
             let harmonic_multiplier = rng.gen_range(2..6); // Random integer multiple of the fundamental
-            for i in 0..num_samples {
-                signal[i] +=
-                    amplitude * (2.0 * PI * f * harmonic_multiplier as f32 * i as f32 * dt).sin();
+            for (i, x) in signal.iter_mut().enumerate().take(num_samples) {
+                *x += amplitude * (2.0 * PI * f * harmonic_multiplier as f32 * i as f32 * dt).sin();
             }
         }
 
@@ -296,8 +228,8 @@ mod tests {
 
     #[test]
     fn test_pitch_detection_yin() {
-        let fs = 44100.0; // Sampling rate in Hz
-        let duration = 1.0; // Signal duration in seconds
+        let fs = 44100; // Sampling rate in Hz
+        let duration = 1; // Signal duration in seconds
         let min_frequency = 30.0;
         let max_frequency = 150.0;
 
@@ -326,8 +258,8 @@ mod tests {
 
     #[test]
     fn test_resonator_pitch_detection_yin() {
-        let fs = 44100.0; // Sampling rate in Hz
-        let duration = 1.0; // Signal duration in seconds
+        let fs = 44100; // Sampling rate in Hz
+        let duration = 1; // Signal duration in seconds
         let min_frequency = 30.0;
         let max_frequency = 150.0;
 
@@ -340,9 +272,9 @@ mod tests {
 
         let mut resonators = Resonators::new(
             &[30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0],
-            fs as i32,
+            fs,
             10.0,
-            fs as usize / 20,
+            fs / 20,
         );
         resonators.process_new_samples(&signal);
         let (freq, _) = resonators.current_peak();

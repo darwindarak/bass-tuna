@@ -1,7 +1,9 @@
 use cpal::traits::{DeviceTrait, HostTrait};
-use crossbeam_channel::{after, select, unbounded, Sender};
+use crossbeam_channel::{select, unbounded};
 use lib::audio::{Block, InputBlock, LowpassBlock, PitchDetectorBlock, PulseDetectorBlock};
 use lib::tuner::identify_note_name;
+use ratatui::symbols;
+use ratatui::widgets::{Axis, Chart, Dataset};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
@@ -10,9 +12,9 @@ use ratatui::{
     widgets::{self, Borders, List, ListItem, Paragraph, Widget},
     Frame,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 pub struct RulerWidget<'a> {
     pub current_cents: Option<f32>,
@@ -293,16 +295,16 @@ impl Widget for RulerWidget<'_> {
     }
 }
 
+#[derive(Clone)]
 pub enum AppState {
     DeviceSelection,
-    PitchDisplay { pitch: Option<f32> },
+    PitchDisplay,
 }
 
 pub enum Message {
     SelectNextDevice,
     SelectPreviousDevice,
     ConfirmDevice,
-    UpdateState(AppState),
     Exit,
 }
 
@@ -310,6 +312,9 @@ pub struct Model {
     state: AppState,
     devices: Vec<String>,
     selected_device: usize,
+    sample_rate: usize,
+    pitch: Arc<Mutex<Option<f32>>>,
+    energy_history: Arc<Mutex<VecDeque<(u128, f32)>>>,
 }
 
 impl Model {
@@ -327,12 +332,16 @@ impl Model {
             state,
             devices,
             selected_device: 0,
+            sample_rate: 0,
+            pitch: Arc::new(Mutex::new(None)),
+            energy_history: Arc::new(Mutex::new(VecDeque::from(vec![(0u128, 0.0); 1000]))),
         }
     }
 }
 
 /// Update the model based on messages
-pub fn update(model: &mut Model, msg: Message, state_sender: &Sender<AppState>) {
+pub fn update(model: &mut Model, msg: Message) {
+    //, state_sender: &Sender<Message>) {
     match msg {
         Message::SelectNextDevice => {
             if model.selected_device < model.devices.len() - 1 {
@@ -346,10 +355,11 @@ pub fn update(model: &mut Model, msg: Message, state_sender: &Sender<AppState>) 
         }
         Message::ConfirmDevice => {
             let device_name = model.devices[model.selected_device].clone();
-            model.state = AppState::PitchDisplay { pitch: None };
+            model.state = AppState::PitchDisplay;
 
             let (pitch_ui_sender, pitch_ui_receiver) = unbounded();
             let (pulse_ui_sender, pulse_ui_receiver) = unbounded();
+            let (lowpass_ui_sender, lowpass_ui_receiver) = unbounded();
 
             let mut input_block = InputBlock::new(&device_name);
 
@@ -365,8 +375,10 @@ pub fn update(model: &mut Model, msg: Message, state_sender: &Sender<AppState>) 
                 window_size,
                 update_interval,
             );
+            model.sample_rate = sample_rate;
 
-            let mut lowpass = LowpassBlock::new(10.0, sample_rate, |x| x * x);
+            let mut lowpass =
+                LowpassBlock::new(10.0, sample_rate, Some(move |x| x * x * sample_rate as f32));
             let mut pulse_detector = PulseDetectorBlock::new(1e-2);
 
             input_block.pipe_output_to(&mut pitch_detector);
@@ -375,6 +387,7 @@ pub fn update(model: &mut Model, msg: Message, state_sender: &Sender<AppState>) 
             pitch_detector.add_output(pitch_ui_sender);
 
             lowpass.pipe_output_to(&mut pulse_detector);
+            lowpass.add_output(lowpass_ui_sender);
             pulse_detector.add_output(pulse_ui_sender);
 
             pitch_detector.run();
@@ -383,30 +396,31 @@ pub fn update(model: &mut Model, msg: Message, state_sender: &Sender<AppState>) 
 
             input_block.run();
 
-            //start_audio_processing(device, vec![device_pitch_sender, device_lowpass_sender]);
+            let energy_history = Arc::clone(&model.energy_history);
+            let pitch = Arc::clone(&model.pitch);
 
-            let state_sender = state_sender.clone();
+            thread::spawn(move || loop {
+                select! {
+                    recv(pulse_ui_receiver) -> _ => {
 
-            thread::spawn(move || {
-                let mut identified_pitch = None;
-                loop {
-                    let timeout = Duration::from_millis(50);
-                    select! {
-                        recv(after(timeout)) -> _ => {
-                            state_sender.send(AppState::PitchDisplay{pitch: identified_pitch}).unwrap();
-                        },
-                        recv(pulse_ui_receiver) -> _ => {},
-                        recv(pitch_ui_receiver) -> result => {
-                            if let Ok(freq) = result {
-                                identified_pitch = freq;
+                    },
+                    recv(lowpass_ui_receiver) -> result => {
+                        if let Ok((t, energy)) = result {
+                            {
+                                let mut e = energy_history.lock().unwrap();
+                                e.pop_front();
+                                e.push_back((t, energy.iter().sum::<f32>() / energy.len() as f32));
                             }
-                        },
-                    }
+                        }
+                    },
+                    recv(pitch_ui_receiver) -> result => {
+                        if let Ok(freq) = result {
+                            *pitch.lock().unwrap() = freq;
+                        }
+                    },
+
                 }
             });
-        }
-        Message::UpdateState(update) => {
-            model.state = update;
         }
         Message::Exit => {
             ratatui::restore();
@@ -419,7 +433,7 @@ pub fn update(model: &mut Model, msg: Message, state_sender: &Sender<AppState>) 
 pub fn view(frame: &mut Frame, model: &Model) {
     match model.state {
         AppState::DeviceSelection => draw_device_selection(frame, model),
-        AppState::PitchDisplay { pitch: _ } => draw_pitch_display(frame, model),
+        AppState::PitchDisplay => draw_pitch_display(frame, model),
     }
 }
 
@@ -462,10 +476,22 @@ fn draw_device_selection(frame: &mut Frame, model: &Model) {
 
 /// Draw the pitch display screen
 fn draw_pitch_display(frame: &mut Frame, model: &Model) {
-    let pitch = match model.state {
-        AppState::PitchDisplay { pitch: p } => p,
-        _ => None,
+    let pitch = { *model.pitch.lock().unwrap() };
+    let data = {
+        let e = model.energy_history.lock().unwrap();
+        let len = e.len();
+        let latest = e[len - 1].0;
+        let mut max = 0.0f64;
+        let mut data = Vec::with_capacity(e.len());
+        for &(t, v) in e.iter() {
+            if v as f64 > max {
+                max = v as f64;
+            }
+            data.push(((latest - t) as f64 / -1e9, v as f64));
+        }
+        data
     };
+    //println!("{:?}", data[0]);
 
     let (current_cents, detected_note) = if let Some(freq) = pitch {
         let (note, _, cents) = identify_note_name(freq);
@@ -474,6 +500,11 @@ fn draw_pitch_display(frame: &mut Frame, model: &Model) {
     } else {
         (None, None)
     };
+
+    let layout = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([Constraint::Min(20), Constraint::Percentage(100)])
+        .split(frame.area());
 
     let widget = RulerWidget {
         current_cents,
@@ -488,5 +519,27 @@ fn draw_pitch_display(frame: &mut Frame, model: &Model) {
         n_minor: 5,
     };
 
-    frame.render_widget(widget, frame.area());
+    frame.render_widget(widget, layout[0]);
+
+    let dataset = Dataset::default()
+        .graph_type(widgets::GraphType::Line)
+        .name("\"Energy\"")
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(Color::Blue))
+        .data(&data);
+
+    let chart = Chart::new(vec![dataset])
+        .x_axis(
+            Axis::default()
+                .title("Time")
+                .bounds([-10.0, 0.0])
+                .labels(
+                    (-10..=0)
+                        .map(|x| format!("{}", x as f32))
+                        .collect::<Vec<String>>(),
+                ),
+        )
+        .y_axis(Axis::default().bounds([0.0, 1.25]));
+
+    frame.render_widget(chart, layout[1]);
 }

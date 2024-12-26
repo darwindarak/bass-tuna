@@ -8,21 +8,6 @@ use std::{
     thread,
 };
 
-/// Represents a detected pulse in the input signal.
-#[derive(Clone, Copy)]
-pub struct Pulse {
-    pub energy: f32,
-    pub duration: usize,
-    pub max_amplitude: f32,
-    pub max_time_index: usize,
-}
-
-pub struct PulseDetectorBlock {
-    pub threshold: f32,
-    source: Option<Receiver<(u128, Arc<Vec<f32>>)>>,
-    output: Vec<Sender<Pulse>>,
-}
-
 pub trait Block {
     type InputData;
     type OutputData;
@@ -37,6 +22,21 @@ pub trait Block {
         self.add_output(sender);
         downstream.set_source(receiver);
     }
+}
+
+/// Represents a detected pulse in the input signal.
+#[derive(Clone, Copy)]
+pub struct Pulse {
+    pub energy: f32,
+    pub duration: usize,
+    pub max_amplitude: f32,
+    pub max_time_index: usize,
+}
+
+pub struct PulseDetectorBlock {
+    pub threshold: f32,
+    source: Option<Receiver<(u128, Arc<Vec<f32>>)>>,
+    output: Vec<Sender<Pulse>>,
 }
 
 pub struct InputBlock {
@@ -358,17 +358,21 @@ impl Block for LowpassBlock {
 pub struct LowpassBlock {
     pub cutoff_frequency: f32,
     pub sample_rate: usize,
-    pub transform: fn(f32) -> f32,
+    pub transform: Option<Arc<dyn Fn(f32) -> f32 + Send + Sync>>,
     source: Option<Receiver<(u128, Arc<Vec<f32>>)>>,
     output: Vec<Sender<(u128, Arc<Vec<f32>>)>>,
 }
 
 impl LowpassBlock {
-    pub fn new(cutoff_frequency: f32, sample_rate: usize, transform: fn(f32) -> f32) -> Self {
+    pub fn new(
+        cutoff_frequency: f32,
+        sample_rate: usize,
+        transform: Option<impl Fn(f32) -> f32 + Send + Sync + 'static>,
+    ) -> Self {
         Self {
             cutoff_frequency,
             sample_rate,
-            transform,
+            transform: transform.map(|f| Arc::new(f) as Arc<dyn Fn(f32) -> f32 + Send + Sync>),
             source: None,
             output: vec![],
         }
@@ -380,14 +384,18 @@ impl LowpassBlock {
             let cutoff_frequency = self.cutoff_frequency;
 
             let listeners = self.output.clone();
-            let transform = self.transform;
+            let transform = self.transform.clone();
 
             thread::spawn(move || {
                 let mut filter = Lowpass::new(sample_rate, cutoff_frequency);
                 while let Ok((timestamp, packet)) = source.recv() {
                     let mut buffer = vec![0.0; packet.len()];
                     for (i, &x) in packet.iter().enumerate() {
-                        buffer[i] = filter.apply(transform(x));
+                        buffer[i] = filter.apply(if let Some(f) = transform.as_ref() {
+                            f(x)
+                        } else {
+                            x
+                        });
                     }
 
                     let buffer = Arc::new(buffer);
@@ -448,10 +456,11 @@ impl PitchDetectorBlock {
             let buffer = Arc::new(Mutex::new(CircularBuffer::new(self.window_size)));
             let buffer_reader = Arc::clone(&buffer);
 
+            let cutoff_frequency = 10.0;
             let resonators = Arc::new(Mutex::new(Resonators::new(
                 &candidate_frequencies,
-                sample_rate as i32,
-                10.0,
+                sample_rate,
+                cutoff_frequency,
                 sample_rate / 20,
             )));
             let resonators_reader = Arc::clone(&resonators);
@@ -478,7 +487,7 @@ impl PitchDetectorBlock {
 
                     let mut pitch = identify_frequency(
                         &work_buffer,
-                        sample_rate as f32,
+                        sample_rate,
                         f_candidate - 5.0,
                         f_candidate + 5.0,
                         true,
@@ -490,7 +499,7 @@ impl PitchDetectorBlock {
                     if pitch.is_none() {
                         pitch = identify_frequency(
                             &work_buffer,
-                            sample_rate as f32,
+                            sample_rate,
                             0.5 * f_candidate - 5.0,
                             0.5 * f_candidate + 5.0,
                             true,
