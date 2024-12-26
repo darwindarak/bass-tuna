@@ -1,8 +1,8 @@
 use crate::filters::Lowpass;
 use crate::tuner::{identify_frequency, Resonators};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::RwLock;
+use crossbeam_channel::{Receiver, Sender};
+use std::time::{Duration, Instant};
 use std::{
     sync::{Arc, Mutex},
     thread,
@@ -17,9 +17,34 @@ pub struct Pulse {
     pub max_time_index: usize,
 }
 
+pub struct PulseDetectorBlock {
+    pub threshold: f32,
+    pub source: Receiver<(u128, Arc<Vec<f32>>)>,
+    pub output: Vec<Sender<Pulse>>,
+}
+
+impl PulseDetectorBlock {
+    pub fn run(&self) {
+        let threshold = self.threshold;
+
+        let source = self.source.clone();
+        let listeners = self.output.clone();
+
+        thread::spawn(move || {
+            let mut detector = PulseDetector::new(threshold);
+            while let Ok((_timestamp, sample)) = source.recv() {
+                if let Some((pulse, _start)) = detector.process_new_samples(&sample) {
+                    for listener in &listeners {
+                        listener.send(pulse).unwrap();
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// Detects pulses in an audio signal based on energy thresholding.
 pub struct PulseDetector {
-    filter: Lowpass<f32>,
     threshold: f32,
     progress: Option<Pulse>,
 }
@@ -31,10 +56,8 @@ impl PulseDetector {
     /// * `sample_rate` - The sampling rate of the input signal in Hz.
     /// * `cutoff_frequency` - Cutoff frequency for the lowpass filter in Hz.
     /// * `threshold` - Energy threshold for detecting pulses.
-    pub fn new(sample_rate: usize, cutoff_frequency: f32, threshold: f32) -> Self {
-        let filter = Lowpass::new(sample_rate, cutoff_frequency);
+    pub fn new(threshold: f32) -> Self {
         PulseDetector {
-            filter,
             threshold,
             progress: None,
         }
@@ -79,8 +102,7 @@ impl PulseDetector {
 
         // If no pulse is in progress, look for the start of a new pulse
         if self.progress.is_none() {
-            for (i, &val) in samples.iter().enumerate() {
-                let y = self.filter.apply(val * val); // Square input to compute energy
+            for (i, &y) in samples.iter().enumerate() {
                 if y > self.threshold {
                     self.progress = Some(Pulse {
                         energy: y,
@@ -95,8 +117,7 @@ impl PulseDetector {
         }
 
         if let Some(mut progress) = self.progress.take() {
-            for i in start..samples.len() {
-                let y = self.filter.apply(samples[i] * samples[i]);
+            for (i, &y) in samples.iter().enumerate().skip(start) {
                 progress.energy += y;
                 progress.duration += 1;
 
@@ -152,9 +173,8 @@ impl CircularBuffer {
     ///
     /// # Arguments
     /// * `chunk` - A slice of `f32` values to add to the buffer.
-    pub fn add_chunk(&mut self, chunk: &[f32]) -> bool {
-        let mut wrap = false;
-        if chunk.len() <= self.max_size {
+    pub fn add_chunk(&mut self, chunk: &[f32]) {
+        if chunk.len() < self.max_size {
             // Case 1: Chunk can fit into the buffer without overflow
             let remaining = self.max_size - self.write_index;
 
@@ -173,18 +193,14 @@ impl CircularBuffer {
 
                 // Update the write index to the new position
                 self.write_index = wrapped_length;
-                wrap = true;
             }
         } else {
             // Case 2: Chunk is larger than the buffer size
             // Only the last `max_size` elements are retained
             let start = chunk.len() - self.max_size;
             self.write_index = 0;
-            self.buffer.clone_from_slice(&chunk[start..]);
-            wrap = true;
+            self.buffer.copy_from_slice(&chunk[start..]);
         }
-
-        wrap
     }
 
     /// Copies the current state of the circular buffer into an output slice.
@@ -204,46 +220,6 @@ impl CircularBuffer {
         output[start_len..].copy_from_slice(&self.buffer[..self.write_index]);
     }
 
-    /// Copies the current state of the circular buffer into an output slice.
-    ///
-    /// The data is copied in order, starting from the oldest data to the newest.
-    ///
-    /// # Arguments
-    /// * `output` - A mutable slice where the buffer contents will be copied.
-    ///
-    /// # Panics
-    /// Panics if `output` is not the same length as the circular buffer (`max_size`).
-    pub fn copy_to_buffer_from(&self, output: &mut [f32], start: usize) -> usize {
-        let len = output.len();
-        let end = start + len;
-
-        if start < self.write_index {
-            if end < self.write_index {
-                output.copy_from_slice(&self.buffer[start..end]);
-                len
-            } else {
-                output[..(self.write_index - start)]
-                    .copy_from_slice(&self.buffer[start..self.write_index]);
-                self.write_index - start
-            }
-        } else if end < self.max_size {
-            output.copy_from_slice(&self.buffer[start..end]);
-            len
-        } else {
-            output[..(self.max_size - start)].copy_from_slice(&self.buffer[start..self.max_size]);
-
-            let overlap = end - self.max_size;
-            if overlap < self.write_index {
-                output[(self.max_size - start)..].copy_from_slice(&self.buffer[..overlap]);
-                len
-            } else {
-                output[(self.max_size - start)..(self.max_size - start + self.write_index)]
-                    .copy_from_slice(&self.buffer[..self.write_index]);
-                self.max_size - start + self.write_index
-            }
-        }
-    }
-
     /// Returns a copy of the current state of the buffer as a vector.
     ///
     /// The data is ordered, starting from the oldest to the newest values.
@@ -257,74 +233,86 @@ impl CircularBuffer {
         result
     }
 }
+pub struct LowpassBlock {
+    pub cutoff_frequency: f32,
+    pub sample_rate: usize,
+    pub transform: fn(f32) -> f32,
+    pub source: Receiver<(u128, Arc<Vec<f32>>)>,
+    pub output: Vec<Sender<(u128, Arc<Vec<f32>>)>>,
+}
 
-//pub struct PitchDetectorBlock {
-//    source_buffer: Arc<RwLock<CircularBuffer>>,
-//    source_channel: Receiver<(usize, usize)>,
-//    output_channels: Vec<Sender<f32>>,
-//}
-//
-//impl PitchDetectorBlock {
-//    pub fn run(&self, local_buffer_size: usize) {
-//        let source_channel = self.source_channel.clone();
-//        let source_buffer = Arc::clone(&self.source_buffer);
-//        let output_buffer = Arc::clone(&self.output_buffer);
-//        thread::spawn(move || {
-//            let mut local_buffer = vec![0.0f32; local_buffer_size];
-//            if let Some((start, len)) = source_channel
-//                .try_iter()
-//                .reduce(|(start, len), (_, new_len)| (start, len + new_len))
-//            {
-//
-//            }
-//        });
-//    }
-//}
+impl LowpassBlock {
+    pub fn run(&self) {
+        let source = self.source.clone();
+        let sample_rate = self.sample_rate;
+        let cutoff_frequency = self.cutoff_frequency;
 
-/// Start the audio processing loop
-pub fn start_audio_processing(device_name: String, pitch_tx: Sender<Option<f32>>) {
-    thread::spawn(move || {
-        let host = cpal::default_host();
-        let device = host
-            .input_devices()
-            .unwrap()
-            .find(|d| d.name().unwrap_or_default() == device_name)
-            .expect("Device not found");
+        let listeners = self.output.clone();
+        let transform = self.transform;
 
-        let config = device.default_input_config().unwrap();
-        let sample_rate = config.sample_rate().0;
-        let channels = config.channels() as usize;
+        thread::spawn(move || {
+            let mut filter = Lowpass::new(sample_rate, cutoff_frequency);
+            while let Ok((timestamp, packet)) = source.recv() {
+                let mut buffer = vec![0.0; packet.len()];
+                for (i, &x) in packet.iter().enumerate() {
+                    buffer[i] = filter.apply(transform(x));
+                }
 
-        let max_window = sample_rate / 10; // 2 seconds
+                let buffer = Arc::new(buffer);
 
-        let candidate_frequencies: Vec<f32> = (1..=24)
-            .into_iter()
-            .map(|n| 36.70810 * 2.0f32.powf(n as f32 / 12.0))
-            .collect();
+                for listener in &listeners {
+                    listener.send((timestamp, Arc::clone(&buffer))).unwrap();
+                }
+            }
+        });
+    }
+}
+
+pub struct PitchDetectorBlock {
+    pub candidate_frequencies: Vec<f32>,
+    pub sample_rate: usize,
+    pub window_size: usize,
+    pub update_interval: u64,
+    pub source: Receiver<(u128, Arc<Vec<f32>>)>,
+    pub output: Vec<Sender<Option<f32>>>,
+}
+
+impl PitchDetectorBlock {
+    pub fn run(&self) {
+        let source = self.source.clone();
+        let sample_rate = self.sample_rate;
+        let candidate_frequencies = self.candidate_frequencies.clone();
+
+        let buffer = Arc::new(Mutex::new(CircularBuffer::new(self.window_size)));
+        let buffer_reader = Arc::clone(&buffer);
 
         let resonators = Arc::new(Mutex::new(Resonators::new(
             &candidate_frequencies,
             sample_rate as i32,
             10.0,
-            sample_rate as usize / 20,
+            sample_rate / 20,
         )));
+        let resonators_reader = Arc::clone(&resonators);
 
-        let circular_buffer = Arc::new(Mutex::new(CircularBuffer::new(max_window as usize))); // Share buffer between threads
-        let process_buffer = Arc::clone(&circular_buffer);
-        let resonators_read = Arc::clone(&resonators);
-
-        // Thread to process pitch detection
         thread::spawn(move || {
-            let mut work_buffer = vec![0.0; max_window as usize];
+            while let Ok((_timestamp, packet)) = source.recv() {
+                buffer.lock().unwrap().add_chunk(&packet);
+                resonators.lock().unwrap().process_new_samples(&packet);
+            }
+        });
+
+        let update_interval = self.update_interval;
+        let listeners = self.output.clone();
+        let max_window = self.window_size;
+
+        thread::spawn(move || {
+            let mut work_buffer = vec![0.0; max_window];
             loop {
-                // Safely access and retrieve a linearized copy of the buffer
-                let f_candidate = {
-                    let buf = process_buffer.lock().unwrap();
-                    buf.copy_to_buffer(&mut work_buffer);
-                    let r = resonators_read.lock().unwrap();
-                    let (f_candidate, _) = r.current_peak();
-                    f_candidate
-                };
+                let (f_candidate, _) = resonators_reader.lock().unwrap().current_peak();
+                buffer_reader
+                    .lock()
+                    .unwrap()
+                    .copy_to_buffer(&mut work_buffer);
 
                 let mut pitch = identify_frequency(
                     &work_buffer,
@@ -347,24 +335,45 @@ pub fn start_audio_processing(device_name: String, pitch_tx: Sender<Option<f32>>
                     );
                 }
 
-                pitch_tx.send(pitch).ok();
-                thread::sleep(std::time::Duration::from_millis(150)); // Control processing frequency
+                for listener in &listeners {
+                    listener.send(pitch).unwrap();
+                }
+
+                thread::sleep(Duration::from_millis(update_interval));
             }
         });
+    }
+}
 
-        let input_buffer = Arc::clone(&circular_buffer);
+pub fn get_input_device(device_name: String) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    host.input_devices()
+        .unwrap()
+        .find(|d| d.name().unwrap_or_default() == device_name)
+}
+
+/// Start the audio processing loop
+pub fn start_audio_processing(device: cpal::Device, output: Vec<Sender<(u128, Arc<Vec<f32>>)>>) {
+    thread::spawn(move || {
+        let config = device.default_input_config().unwrap();
+        let channels = config.channels() as usize;
+
+        let now = Instant::now();
+
         let stream = device
             .build_input_stream(
                 &config.into(),
                 move |data: &[f32], _: &_| {
+                    let timestamp = Instant::now().duration_since(now).as_nanos();
                     let mono_chunk: Vec<f32> = data
                         .chunks(channels)
                         .map(|frame| frame.iter().sum::<f32>() / channels as f32)
                         .collect();
-                    let mut buf = input_buffer.lock().unwrap();
-                    buf.add_chunk(&mono_chunk);
-                    let mut r = resonators.lock().unwrap();
-                    r.process_new_samples(&mono_chunk);
+
+                    let buffer = Arc::new(mono_chunk);
+                    for listener in &output {
+                        listener.send((timestamp, buffer.clone())).unwrap();
+                    }
                 },
                 |err| eprintln!("Stream error: {}", err),
                 None,
@@ -396,28 +405,25 @@ mod tests {
     #[test]
     fn test_add_chunk_smaller_than_buffer() {
         let mut buffer = CircularBuffer::new(5);
-        let wrap = buffer.add_chunk(&[1.0, 2.0]);
+        buffer.add_chunk(&[1.0, 2.0]);
         assert_eq!(buffer.get_buffer(), vec![0.0, 0.0, 0.0, 1.0, 2.0]);
-        assert!(!wrap);
     }
 
     #[test]
     fn test_add_chunk_wrap_around() {
         let mut buffer = CircularBuffer::new(5);
         buffer.add_chunk(&[1.0, 2.0, 3.0]);
-        let wrap = buffer.add_chunk(&[4.0, 5.0, 6.0]);
+        buffer.add_chunk(&[4.0, 5.0, 6.0]);
         // Expected: Last 5 values, wrapped around
         assert_eq!(buffer.get_buffer(), vec![2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert!(wrap);
     }
 
     #[test]
     fn test_add_chunk_larger_than_buffer() {
         let mut buffer = CircularBuffer::new(5);
-        let wrap = buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
         // Expected: Only the last 5 values are retained
         assert_eq!(buffer.get_buffer(), vec![3.0, 4.0, 5.0, 6.0, 7.0]);
-        assert!(wrap);
     }
 
     #[test]
@@ -452,74 +458,24 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_within_range() {
-        let buffer = CircularBuffer {
-            buffer: vec![1.0, 2.0, 3.0, 4.0, 5.0],
-            max_size: 5,
-            write_index: 4,
-        };
-
-        let mut output = vec![0.0; 3];
-        let copied = buffer.copy_to_buffer_from(&mut output, 1);
-        assert_eq!(copied, 3); // Full copy within range
-        assert_eq!(output, vec![2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_copy_stops_at_write_index() {
-        let buffer = CircularBuffer {
-            buffer: vec![10.0, 20.0, 30.0, 40.0, 50.0],
-            max_size: 5,
-            write_index: 3,
-        };
-
-        let mut output = vec![0.0; 5];
-        let copied = buffer.copy_to_buffer_from(&mut output, 1);
-        assert_eq!(copied, 2); // Stops at write_index
-        assert_eq!(output[..copied], vec![20.0, 30.0]);
-    }
-
-    #[test]
-    fn test_copy_wraparound() {
-        let buffer = CircularBuffer {
-            buffer: vec![6.0, 7.0, 8.0, 9.0, 10.0],
-            max_size: 5,
-            write_index: 2,
-        };
-
-        let mut output = vec![0.0; 4];
-        let copied = buffer.copy_to_buffer_from(&mut output, 3);
-        assert_eq!(copied, 4); // Wraps around and stops at write_index
-        assert_eq!(output, vec![9.0, 10.0, 6.0, 7.0]);
-    }
-
-    #[test]
-    fn test_partial_wraparound() {
-        let buffer = CircularBuffer {
-            buffer: vec![10.0, 20.0, 30.0, 40.0, 50.0],
-            max_size: 5,
-            write_index: 3,
-        };
-
-        let mut output = vec![0.0; 5];
-        let copied = buffer.copy_to_buffer_from(&mut output, 4);
-        assert_eq!(copied, 4); // Wraps around partially
-        assert_eq!(output[..copied], vec![50.0, 10.0, 20.0, 30.0]);
-    }
-    #[test]
     fn test_single_pulse() {
         let sample_rate = 44100;
         let cutoff_frequency = sample_rate as f32;
         let threshold = 0.01;
-
-        let mut detector = PulseDetector::new(sample_rate, cutoff_frequency, threshold);
 
         // Simulated signal with one pulse
         let samples = vec![
             0.0, 0.0, 0.0, 0.2, 0.5, 1.0, 0.5, 0.2, 0.0, 0.0, 0.0, // Single pulse
         ];
 
-        if let Some((pulse, _)) = detector.process_new_samples(&samples) {
+        let mut filter = Lowpass::new(sample_rate, cutoff_frequency);
+        let mut energy = samples.clone();
+        for (i, &x) in samples.iter().enumerate() {
+            energy[i] = filter.apply(x * x);
+        }
+
+        let mut detector = PulseDetector::new(threshold);
+        if let Some((pulse, _)) = detector.process_new_samples(&energy) {
             assert!(pulse.energy > 0.1, "Energy should be above threshold");
             assert_eq!(pulse.duration, 6, "Pulse duration should be 6 samples");
             assert_approx_eq!(pulse.max_amplitude, 0.8930, 1e-3);
@@ -534,7 +490,7 @@ mod tests {
         let cutoff_frequency = sample_rate as f32;
         let threshold = 0.01;
 
-        let mut detector = PulseDetector::new(sample_rate, cutoff_frequency, threshold);
+        let mut detector = PulseDetector::new(threshold);
 
         // Simulated signal with one pulse
         let samples = vec![
@@ -544,8 +500,14 @@ mod tests {
             0.0, 0.0, 0.0, 0.2, 0.5, 1.0, 0.5, 0.2, 0.0, 0.0, 0.0, // second pulse
         ];
 
+        let mut filter = Lowpass::new(sample_rate, cutoff_frequency);
+        let mut energy = samples.clone();
+        for (i, &x) in samples.iter().enumerate() {
+            energy[i] = filter.apply(x * x);
+        }
+
         // Detect the first pulse
-        if let Some((pulse, end_index)) = detector.process_new_samples(&samples) {
+        if let Some((pulse, end_index)) = detector.process_new_samples(&energy) {
             assert!(pulse.energy > 0.1, "Energy should be above threshold");
             assert_eq!(
                 pulse.duration, 6,
@@ -554,7 +516,7 @@ mod tests {
             assert_approx_eq!(pulse.max_amplitude, 0.8930, 1e-3);
 
             // Detect the second pulse
-            if let Some((pulse, _)) = detector.process_new_samples(&samples[end_index + 1..]) {
+            if let Some((pulse, _)) = detector.process_new_samples(&energy[end_index + 1..]) {
                 assert!(pulse.energy > 0.1, "Energy should be above threshold");
                 assert_eq!(
                     pulse.duration, 6,

@@ -1,5 +1,8 @@
 use cpal::traits::{DeviceTrait, HostTrait};
-use lib::audio::start_audio_processing;
+use crossbeam_channel::{after, select, unbounded, Sender};
+use lib::audio::{
+    get_input_device, start_audio_processing, LowpassBlock, PitchDetectorBlock, PulseDetectorBlock,
+};
 use lib::tuner::identify_note_name;
 use ratatui::{
     buffer::Buffer,
@@ -9,7 +12,9 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Widget},
     Frame,
 };
-use std::{collections::HashMap, sync::mpsc::Sender};
+use std::collections::HashMap;
+use std::thread;
+use std::time::Duration;
 
 pub struct RulerWidget<'a> {
     pub current_cents: Option<f32>,
@@ -293,16 +298,16 @@ impl<'a> Widget for RulerWidget<'a> {
     }
 }
 
-enum AppState {
+pub enum AppState {
     DeviceSelection,
-    PitchDisplay,
+    PitchDisplay { pitch: Option<f32> },
 }
 
 pub enum Message {
     SelectNextDevice,
     SelectPreviousDevice,
     ConfirmDevice,
-    UpdatePitch(Option<f32>),
+    UpdateState(AppState),
     Exit,
 }
 
@@ -310,7 +315,6 @@ pub struct Model {
     state: AppState,
     devices: Vec<String>,
     selected_device: usize,
-    pitch: Option<f32>,
 }
 
 impl Model {
@@ -322,17 +326,18 @@ impl Model {
             .map(|d| d.name().unwrap_or_else(|_| "Unknown Device".to_string()))
             .collect();
 
+        let state = AppState::DeviceSelection;
+
         Model {
-            state: AppState::DeviceSelection,
+            state,
             devices,
             selected_device: 0,
-            pitch: None,
         }
     }
 }
 
 /// Update the model based on messages
-pub fn update(model: &mut Model, msg: Message, pitch_tx: &Sender<Option<f32>>) {
+pub fn update(model: &mut Model, msg: Message, state_sender: &Sender<AppState>) {
     match msg {
         Message::SelectNextDevice => {
             if model.selected_device < model.devices.len() - 1 {
@@ -346,11 +351,76 @@ pub fn update(model: &mut Model, msg: Message, pitch_tx: &Sender<Option<f32>>) {
         }
         Message::ConfirmDevice => {
             let device_name = model.devices[model.selected_device].clone();
-            model.state = AppState::PitchDisplay;
-            start_audio_processing(device_name, pitch_tx.clone());
+            model.state = AppState::PitchDisplay { pitch: None };
+
+            let device = get_input_device(device_name).expect("Cannot get input device");
+            let config = device
+                .default_input_config()
+                .expect("Cannot get device configuration");
+
+            let (device_lowpass_sender, device_lowpass_receiver) = unbounded();
+            let (device_pitch_sender, device_pitch_receiver) = unbounded();
+            let (lowpass_pulse_sender, lowpass_pulse_receiver) = unbounded();
+            let (pitch_ui_sender, pitch_ui_receiver) = unbounded();
+            let (pulse_ui_sender, pulse_ui_receiver) = unbounded();
+
+            let candidate_frequencies: Vec<f32> = (1..=24)
+                .into_iter()
+                .map(|n| 36.70810 * 2.0f32.powf(n as f32 / 12.0))
+                .collect();
+            let sample_rate = config.sample_rate().0 as usize;
+            let window_size = sample_rate / 10;
+
+            let pitch_detector = PitchDetectorBlock {
+                candidate_frequencies,
+                sample_rate,
+                window_size,
+                update_interval: 150,
+                source: device_pitch_receiver,
+                output: vec![pitch_ui_sender],
+            };
+            pitch_detector.run();
+
+            let lowpass = LowpassBlock {
+                cutoff_frequency: 10.0,
+                sample_rate,
+                source: device_lowpass_receiver,
+                output: vec![lowpass_pulse_sender],
+                transform: |x| x * x,
+            };
+            lowpass.run();
+
+            let pulse_detector = PulseDetectorBlock {
+                threshold: 1e-2,
+                source: lowpass_pulse_receiver,
+                output: vec![pulse_ui_sender],
+            };
+            pulse_detector.run();
+
+            let state_sender = state_sender.clone();
+
+            thread::spawn(move || {
+                let mut identified_pitch = None;
+                loop {
+                    let timeout = Duration::from_millis(100);
+                    select! {
+                        recv(after(timeout)) -> _ => {
+                            state_sender.send(AppState::PitchDisplay{pitch: identified_pitch}).unwrap();
+                        },
+                        recv(pulse_ui_receiver) -> _ => {},
+                        recv(pitch_ui_receiver) -> result => {
+                            if let Ok(freq) = result {
+                                identified_pitch = freq;
+                            }
+                        },
+                    }
+                }
+            });
+
+            start_audio_processing(device, vec![device_pitch_sender, device_lowpass_sender]);
         }
-        Message::UpdatePitch(pitch) => {
-            model.pitch = pitch;
+        Message::UpdateState(update) => {
+            model.state = update;
         }
         Message::Exit => {
             ratatui::restore();
@@ -363,7 +433,7 @@ pub fn update(model: &mut Model, msg: Message, pitch_tx: &Sender<Option<f32>>) {
 pub fn view(frame: &mut Frame, model: &Model) {
     match model.state {
         AppState::DeviceSelection => draw_device_selection(frame, model),
-        AppState::PitchDisplay => draw_pitch_display(frame, model),
+        AppState::PitchDisplay { pitch: _ } => draw_pitch_display(frame, model),
     }
 }
 
@@ -399,7 +469,12 @@ fn draw_device_selection(frame: &mut Frame, model: &Model) {
 
 /// Draw the pitch display screen
 fn draw_pitch_display(frame: &mut Frame, model: &Model) {
-    let (current_cents, detected_note) = if let Some(freq) = model.pitch {
+    let pitch = match model.state {
+        AppState::PitchDisplay { pitch: p } => p,
+        _ => None,
+    };
+
+    let (current_cents, detected_note) = if let Some(freq) = pitch {
         let (note, _, cents) = identify_note_name(freq);
 
         (Some(cents), Some(note))

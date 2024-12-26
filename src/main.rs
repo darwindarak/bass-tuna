@@ -1,15 +1,15 @@
 mod tui;
-use crate::tui::{update, view, Message, Model};
+use crate::tui::{update, view, AppState, Message, Model};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use ratatui::crossterm::event::{self, Event, KeyCode};
 use std::io::{self};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
     terminal.clear()?;
 
-    let (pitch_tx, pitch_rx): (Sender<Option<f32>>, Receiver<Option<f32>>) = channel();
+    let (state_sender, state_receiver): (Sender<AppState>, Receiver<AppState>) = unbounded();
     let mut model = Model::new();
 
     loop {
@@ -19,11 +19,15 @@ fn main() -> io::Result<()> {
             if let Ok(event) = event::read() {
                 match event {
                     Event::Key(key_event) => match key_event.code {
-                        KeyCode::Up => update(&mut model, Message::SelectPreviousDevice, &pitch_tx),
-                        KeyCode::Down => update(&mut model, Message::SelectNextDevice, &pitch_tx),
-                        KeyCode::Enter => update(&mut model, Message::ConfirmDevice, &pitch_tx),
-                        KeyCode::Esc => update(&mut model, Message::Exit, &pitch_tx),
-                        KeyCode::Char('q') => update(&mut model, Message::Exit, &pitch_tx),
+                        KeyCode::Up => {
+                            update(&mut model, Message::SelectPreviousDevice, &state_sender)
+                        }
+                        KeyCode::Down => {
+                            update(&mut model, Message::SelectNextDevice, &state_sender)
+                        }
+                        KeyCode::Enter => update(&mut model, Message::ConfirmDevice, &state_sender),
+                        KeyCode::Esc => update(&mut model, Message::Exit, &state_sender),
+                        KeyCode::Char('q') => update(&mut model, Message::Exit, &state_sender),
                         _ => {}
                     },
                     _ => {}
@@ -31,8 +35,8 @@ fn main() -> io::Result<()> {
             }
         }
 
-        if let Ok(pitch) = pitch_rx.try_recv() {
-            update(&mut model, Message::UpdatePitch(pitch), &pitch_tx);
+        if let Ok(state) = state_receiver.try_recv() {
+            update(&mut model, Message::UpdateState(state), &state_sender);
         }
     }
 }
