@@ -1,7 +1,8 @@
 use crate::filters::Lowpass;
 use crate::tuner::{identify_frequency, Resonators};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::RwLock;
 use std::{
     sync::{Arc, Mutex},
     thread,
@@ -151,8 +152,9 @@ impl CircularBuffer {
     ///
     /// # Arguments
     /// * `chunk` - A slice of `f32` values to add to the buffer.
-    pub fn add_chunk(&mut self, chunk: &[f32]) {
-        if chunk.len() < self.max_size {
+    pub fn add_chunk(&mut self, chunk: &[f32]) -> bool {
+        let mut wrap = false;
+        if chunk.len() <= self.max_size {
             // Case 1: Chunk can fit into the buffer without overflow
             let remaining = self.max_size - self.write_index;
 
@@ -171,6 +173,7 @@ impl CircularBuffer {
 
                 // Update the write index to the new position
                 self.write_index = wrapped_length;
+                wrap = true;
             }
         } else {
             // Case 2: Chunk is larger than the buffer size
@@ -178,7 +181,10 @@ impl CircularBuffer {
             let start = chunk.len() - self.max_size;
             self.write_index = 0;
             self.buffer.clone_from_slice(&chunk[start..]);
+            wrap = true;
         }
+
+        wrap
     }
 
     /// Copies the current state of the circular buffer into an output slice.
@@ -198,6 +204,46 @@ impl CircularBuffer {
         output[start_len..].copy_from_slice(&self.buffer[..self.write_index]);
     }
 
+    /// Copies the current state of the circular buffer into an output slice.
+    ///
+    /// The data is copied in order, starting from the oldest data to the newest.
+    ///
+    /// # Arguments
+    /// * `output` - A mutable slice where the buffer contents will be copied.
+    ///
+    /// # Panics
+    /// Panics if `output` is not the same length as the circular buffer (`max_size`).
+    pub fn copy_to_buffer_from(&self, output: &mut [f32], start: usize) -> usize {
+        let len = output.len();
+        let end = start + len;
+
+        if start < self.write_index {
+            if end < self.write_index {
+                output.copy_from_slice(&self.buffer[start..end]);
+                len
+            } else {
+                output[..(self.write_index - start)]
+                    .copy_from_slice(&self.buffer[start..self.write_index]);
+                self.write_index - start
+            }
+        } else if end < self.max_size {
+            output.copy_from_slice(&self.buffer[start..end]);
+            len
+        } else {
+            output[..(self.max_size - start)].copy_from_slice(&self.buffer[start..self.max_size]);
+
+            let overlap = end - self.max_size;
+            if overlap < self.write_index {
+                output[(self.max_size - start)..].copy_from_slice(&self.buffer[..overlap]);
+                len
+            } else {
+                output[(self.max_size - start)..(self.max_size - start + self.write_index)]
+                    .copy_from_slice(&self.buffer[..self.write_index]);
+                self.max_size - start + self.write_index
+            }
+        }
+    }
+
     /// Returns a copy of the current state of the buffer as a vector.
     ///
     /// The data is ordered, starting from the oldest to the newest values.
@@ -211,6 +257,29 @@ impl CircularBuffer {
         result
     }
 }
+
+//pub struct PitchDetectorBlock {
+//    source_buffer: Arc<RwLock<CircularBuffer>>,
+//    source_channel: Receiver<(usize, usize)>,
+//    output_channels: Vec<Sender<f32>>,
+//}
+//
+//impl PitchDetectorBlock {
+//    pub fn run(&self, local_buffer_size: usize) {
+//        let source_channel = self.source_channel.clone();
+//        let source_buffer = Arc::clone(&self.source_buffer);
+//        let output_buffer = Arc::clone(&self.output_buffer);
+//        thread::spawn(move || {
+//            let mut local_buffer = vec![0.0f32; local_buffer_size];
+//            if let Some((start, len)) = source_channel
+//                .try_iter()
+//                .reduce(|(start, len), (_, new_len)| (start, len + new_len))
+//            {
+//
+//            }
+//        });
+//    }
+//}
 
 /// Start the audio processing loop
 pub fn start_audio_processing(device_name: String, pitch_tx: Sender<Option<f32>>) {
@@ -327,25 +396,28 @@ mod tests {
     #[test]
     fn test_add_chunk_smaller_than_buffer() {
         let mut buffer = CircularBuffer::new(5);
-        buffer.add_chunk(&[1.0, 2.0]);
+        let wrap = buffer.add_chunk(&[1.0, 2.0]);
         assert_eq!(buffer.get_buffer(), vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+        assert!(!wrap);
     }
 
     #[test]
     fn test_add_chunk_wrap_around() {
         let mut buffer = CircularBuffer::new(5);
         buffer.add_chunk(&[1.0, 2.0, 3.0]);
-        buffer.add_chunk(&[4.0, 5.0, 6.0]);
+        let wrap = buffer.add_chunk(&[4.0, 5.0, 6.0]);
         // Expected: Last 5 values, wrapped around
         assert_eq!(buffer.get_buffer(), vec![2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(wrap);
     }
 
     #[test]
     fn test_add_chunk_larger_than_buffer() {
         let mut buffer = CircularBuffer::new(5);
-        buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let wrap = buffer.add_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
         // Expected: Only the last 5 values are retained
         assert_eq!(buffer.get_buffer(), vec![3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert!(wrap);
     }
 
     #[test]
@@ -379,6 +451,61 @@ mod tests {
         buffer.copy_to_buffer(&mut output);
     }
 
+    #[test]
+    fn test_copy_within_range() {
+        let buffer = CircularBuffer {
+            buffer: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+            max_size: 5,
+            write_index: 4,
+        };
+
+        let mut output = vec![0.0; 3];
+        let copied = buffer.copy_to_buffer_from(&mut output, 1);
+        assert_eq!(copied, 3); // Full copy within range
+        assert_eq!(output, vec![2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_copy_stops_at_write_index() {
+        let buffer = CircularBuffer {
+            buffer: vec![10.0, 20.0, 30.0, 40.0, 50.0],
+            max_size: 5,
+            write_index: 3,
+        };
+
+        let mut output = vec![0.0; 5];
+        let copied = buffer.copy_to_buffer_from(&mut output, 1);
+        assert_eq!(copied, 2); // Stops at write_index
+        assert_eq!(output[..copied], vec![20.0, 30.0]);
+    }
+
+    #[test]
+    fn test_copy_wraparound() {
+        let buffer = CircularBuffer {
+            buffer: vec![6.0, 7.0, 8.0, 9.0, 10.0],
+            max_size: 5,
+            write_index: 2,
+        };
+
+        let mut output = vec![0.0; 4];
+        let copied = buffer.copy_to_buffer_from(&mut output, 3);
+        assert_eq!(copied, 4); // Wraps around and stops at write_index
+        assert_eq!(output, vec![9.0, 10.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn test_partial_wraparound() {
+        let buffer = CircularBuffer {
+            buffer: vec![10.0, 20.0, 30.0, 40.0, 50.0],
+            max_size: 5,
+            write_index: 3,
+        };
+
+        let mut output = vec![0.0; 5];
+        let copied = buffer.copy_to_buffer_from(&mut output, 4);
+        assert_eq!(copied, 4); // Wraps around partially
+        assert_eq!(output[..copied], vec![50.0, 10.0, 20.0, 30.0]);
+    }
     #[test]
     fn test_single_pulse() {
         let sample_rate = 44100;
