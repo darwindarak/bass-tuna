@@ -1,5 +1,6 @@
 [deps]
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+ContinuousWavelets = "96eb917e-2868-4417-9cb6-27e7ff17528f"
 DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
@@ -7,3 +8,5 @@ IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
 Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 WAV = "8149f6b0-98f6-5db9-b78f-408fbbb8ef88"
+WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"
+Wavelets = "29a6e085-ba6d-5f35-a997-948ac2efa89a"
