@@ -1,4 +1,4 @@
-use crate::filters::Lowpass;
+use crate::filters::new_lowpass_1;
 use crate::tuner::{identify_frequency, Resonators};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -387,7 +387,7 @@ impl LowpassBlock {
             let transform = self.transform.clone();
 
             thread::spawn(move || {
-                let mut filter = Lowpass::new(sample_rate, cutoff_frequency);
+                let mut filter = new_lowpass_1(cutoff_frequency, sample_rate as f32);
                 while let Ok((timestamp, packet)) = source.recv() {
                     let mut buffer = vec![0.0; packet.len()];
                     for (i, &x) in packet.iter().enumerate() {
@@ -640,7 +640,7 @@ mod tests {
             0.0, 0.0, 0.0, 0.2, 0.5, 1.0, 0.5, 0.2, 0.0, 0.0, 0.0, // Single pulse
         ];
 
-        let mut filter = Lowpass::new(sample_rate, cutoff_frequency);
+        let mut filter = new_lowpass_1(cutoff_frequency, sample_rate as f32);
         let mut energy = samples.clone();
         for (i, &x) in samples.iter().enumerate() {
             energy[i] = filter.apply(x * x);
@@ -672,7 +672,7 @@ mod tests {
             0.0, 0.0, 0.0, 0.2, 0.5, 1.0, 0.5, 0.2, 0.0, 0.0, 0.0, // second pulse
         ];
 
-        let mut filter = Lowpass::new(sample_rate, cutoff_frequency);
+        let mut filter = new_lowpass_1(cutoff_frequency, sample_rate as f32);
         let mut energy = samples.clone();
         for (i, &x) in samples.iter().enumerate() {
             energy[i] = filter.apply(x * x);

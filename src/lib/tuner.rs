@@ -1,9 +1,10 @@
-use crate::filters::BiquadFilter;
+use crate::filters::new_lowpass_2;
+use crate::filters::IIRFilter;
 
 /// A collection of resonators tuned to specific frequencies.
 pub struct Resonators {
     frequencies: Vec<f32>,           // Target frequencies for the resonators
-    filters: Vec<BiquadFilter<f32>>, // Filters tuned to the target frequencies
+    filters: Vec<IIRFilter<f32, 3>>, // Filters tuned to the target frequencies
     energy_histories: Vec<Vec<f32>>, // Historical energy values for each filter
     energies: Vec<f32>,              // Current energy levels for each filter
     n_energy_history: usize,         // Number of historical energy samples to track
@@ -19,9 +20,9 @@ impl Resonators {
     /// * `q` - The quality factor for the resonators.
     /// * `n_energy_history` - The size of the energy history buffer.
     pub fn new(frequencies: &[f32], sample_rate: usize, q: f32, n_energy_history: usize) -> Self {
-        let filters: Vec<BiquadFilter<f32>> = frequencies
+        let filters: Vec<IIRFilter<f32, 3>> = frequencies
             .iter()
-            .map(|&f| BiquadFilter::new(f, sample_rate, q))
+            .map(|&f| new_lowpass_2(f, sample_rate as f32, q))
             .collect();
 
         let energy_histories: Vec<Vec<f32>> = vec![vec![0.0; n_energy_history]; frequencies.len()];
